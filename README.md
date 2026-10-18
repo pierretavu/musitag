@@ -47,6 +47,9 @@ cd ~/musitag
 ./install.sh
 ```
 
+Le dossier `~/musitag` est conservé : il sert aux mises à jour. Il peut être placé ailleurs,
+mais pas dans `/usr/local/bin`, où s'installe la commande `musitag`.
+
 Le script :
 
 1. installe les dépendances depuis les dépôts officiels de la distribution : Python 3, rich,
@@ -206,5 +209,6 @@ programmes.
 | 1.5 | Dossier musique configurable, installeur Fedora / Debian / Ubuntu |
 | 1.5.1 | Détection plus fiable de l'encodage des `.cue` |
 | 1.5.2 | Correctifs de sécurité, installation et mise à jour par `git` |
+| 1.5.3 | Installation : détection d'un dépôt cloné dans `/usr/local/bin` |
 
 Le détail de chaque version figure dans [CHANGELOG.md](CHANGELOG.md).

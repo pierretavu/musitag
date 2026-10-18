@@ -1,5 +1,11 @@
 # Journal des versions
 
+## 1.5.3 — 18 octobre 2026
+- Installation : si le dépôt a été cloné dans `/usr/local/bin` (l'emplacement de la commande
+  `musitag`), l'installeur s'arrête aussitôt et indique comment le déplacer ; la
+  désinstallation ne supprime plus jamais un dossier à cet emplacement.
+- Installation : en cas d'échec au démarrage de musitag, le journal est réellement affiché.
+
 ## 1.5.2 — 17 octobre 2026
 - Sécurité : les caractères de contrôle contenus dans les tags, les noms de fichiers, les
   `.cue` ou les réponses en ligne sont neutralisés à l'affichage (un fichier piégé ne peut

@@ -110,7 +110,10 @@ if [ "$UNINSTALL" -eq 1 ]; then
   step "Suppression"
   removed=0
   for p in "$BIN" "$APP_DIR" "$CONF"; do
-    if [ -e "$p" ]; then rm -rf -- "$p"; ok "$p"; removed=1; fi
+    if [ "$p" = "$BIN" ] && [ -d "$p" ] && [ ! -L "$p" ]; then
+      warn "$BIN est un dossier, pas la commande musitag : laissé en place"; continue
+    fi
+    if [ -e "$p" ] || [ -L "$p" ]; then rm -rf -- "$p"; ok "$p"; removed=1; fi
   done
   for h in /root "$(getent passwd "${SUDO_USER:-root}" | cut -d: -f6 || true)"; do
     if [ -n "$h" ] && [ -d "$h/.config/musitag" ]; then rm -rf -- "$h/.config/musitag"; ok "$h/.config/musitag"; removed=1; fi
@@ -123,6 +126,18 @@ if [ "$UNINSTALL" -eq 1 ]; then
 fi
 
 printf '\n%s♫ musitag %s%s — installation\n' "$M" "$MUSITAG_VERSION" "$N"
+
+# ── l'emplacement de la commande doit être libre (pas un dossier) ────────────
+if [ -d "$BIN" ] && [ ! -L "$BIN" ]; then
+  if [ -e "$BIN/install.sh" ] || [ -d "$BIN/.git" ]; then
+    die "Le dépôt musitag a été cloné dans $BIN : c'est l'emplacement de la commande musitag.
+  Déplace-le dans ton dossier personnel, puis relance l'installation :
+
+      cd ~ && mv $BIN ~/musitag && rm -f ~/musitag/musitag
+      cd ~/musitag && ./install.sh"
+  fi
+  die "$BIN est un dossier : c'est l'emplacement de la commande musitag. Déplace ou supprime ce dossier, puis relance."
+fi
 
 # ── le programme, inclus à la fin de ce fichier ──────────────────────────────
 step "Vérification du fichier"
@@ -311,7 +326,11 @@ step "Installation de musitag"
 { printf '#!%s\n' "$PY"; tail -n +2 "$TMP/musitag.py"; } > "$TMP/musitag"
 install -D -m 755 "$TMP/musitag" "$BIN"
 INSTALLED_VERSION="$(PYTHONDONTWRITEBYTECODE=1 "$BIN" --version 2>>"$LOG" || true)"
-[ "$INSTALLED_VERSION" = "musitag $MUSITAG_VERSION" ] || die "musitag ne démarre pas (voir le journal ci-dessus)."
+if [ "$INSTALLED_VERSION" != "musitag $MUSITAG_VERSION" ]; then
+  printf '  %sDernières lignes du journal :%s\n' "$D" "$N" >&2
+  tail -n 15 "$LOG" | sed 's/^/    /' >&2
+  die "musitag ne démarre pas (journal ci-dessus)."
+fi
 ok "$BIN ${D}($INSTALLED_VERSION)${N}"
 
 # dossier musique ouvert au démarrage

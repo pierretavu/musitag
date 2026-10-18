@@ -51,7 +51,7 @@ _VENDOR_DIR = "/opt/musitag/lib"
 if os.path.isdir(_VENDOR_DIR) and _VENDOR_DIR not in sys.path:
     sys.path.insert(0, _VENDOR_DIR)
 
-VERSION = "1.5.2"
+VERSION = "1.5.3"
 
 
 def install_cmd(*pkgs_by_distro: str) -> str:
