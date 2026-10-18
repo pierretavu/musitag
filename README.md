@@ -141,6 +141,13 @@ remplacées. Les morceaux reconnus comme instrumentaux reçoivent la mention « 
 paroles ♪ », qui peut aussi être ajoutée manuellement. LRCLIB est un service public et gratuit :
 aucun compte ni clé n'est nécessaire.
 
+musitag ménage ce service : une requête par morceau pour la correspondance exacte, puis une
+seule recherche par album pour les autres. Si LRCLIB sature, musitag cesse de l'interroger
+pendant quelques minutes au lieu d'insister : les recherches concernées sont signalées comme
+reportées, et il suffit de relancer plus tard. Les morceaux introuvables sont mémorisés pendant
+30 jours (`~/.cache/musitag/lrclib-introuvables.json`) et ne sont pas recherchés de nouveau
+d'ici là ; supprimer ce fichier force une nouvelle recherche.
+
 ### Pochettes
 
 Les éditions de l'album sont recherchées sur MusicBrainz et Cover Art Archive, puis affichées en
@@ -276,5 +283,6 @@ programmes.
 | 1.5.2 | Correctifs de sécurité, installation et mise à jour par `git` |
 | 1.5.3 | Installation : détection d'un dépôt cloné dans `/usr/local/bin` |
 | 1.6 | Scripts : enchaînements d'actions sans code, lancés avec `musitag -s` |
+| 1.6.1 | Paroles : bien moins de requêtes à LRCLIB, pause automatique quand il sature, introuvables mémorisés |
 
 Le détail de chaque version figure dans [CHANGELOG.md](CHANGELOG.md).

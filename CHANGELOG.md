@@ -1,5 +1,19 @@
 # Journal des versions
 
+## 1.6.1 — 18 octobre 2026
+- Paroles : musitag n'insiste plus quand LRCLIB sature. Un seul réessai court par requête ;
+  après plusieurs échecs d'affilée, LRCLIB est mis en pause (1 minute, puis plus longtemps
+  s'il sature encore) et les recherches restantes sont signalées comme reportées au lieu
+  d'attendre. Un script continue ses autres étapes et rappelle dans le bilan qu'il suffit de
+  le relancer plus tard.
+- Paroles : bien moins de requêtes. La correspondance exacte (une requête par morceau), puis
+  une seule recherche par album, partagée entre ses morceaux, avant toute recherche morceau
+  par morceau. Exemple : un album de 10 titres absent de LRCLIB passe de 50 à 22 requêtes.
+- Paroles : les morceaux introuvables sont mémorisés 30 jours
+  (`~/.cache/musitag/lrclib-introuvables.json`) et ne sont pas recherchés de nouveau d'ici là
+  (sauf recherche manuelle).
+- Menus : « Relancer ces recherches » attend la fin de la pause de LRCLIB avant de réessayer.
+
 ## 1.6 — 18 octobre 2026
 - **Scripts** : enchaînements d'actions créés sans code depuis musitag (touche **s**) et
   enregistrés dans `~/.config/musitag/scripts/NOM.mst`.

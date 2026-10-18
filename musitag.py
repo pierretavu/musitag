@@ -51,7 +51,7 @@ _VENDOR_DIR = "/opt/musitag/lib"
 if os.path.isdir(_VENDOR_DIR) and _VENDOR_DIR not in sys.path:
     sys.path.insert(0, _VENDOR_DIR)
 
-VERSION = "1.6"
+VERSION = "1.6.1"
 
 
 def install_cmd(*pkgs_by_distro: str) -> str:
@@ -1324,43 +1324,160 @@ def _http_error_message(code: int) -> str:
     return f"erreur LRCLIB (HTTP {code})"
 
 
+LRCLIB_TIMEOUT = 15               # secondes par requête
+BREAKER_FAILS = 4                 # échecs d'affilée (saturation, panne) avant de mettre LRCLIB en pause
+BREAKER_COOLDOWN = 60.0           # durée de la pause ; doublée à chaque rechute
+BREAKER_MAX = 600.0
+
+
+class LrclibDeferred(LrclibError):
+    """LRCLIB est en pause (il saturait) : la recherche est reportée sans être tentée."""
+
+
+_BRK_LOCK = threading.Lock()
+_brk = {"fails": 0, "until": 0.0, "cooldown": BREAKER_COOLDOWN, "why": ""}
+
+
+def lrclib_breaker_reset() -> None:
+    with _BRK_LOCK:
+        _brk.update(fails=0, until=0.0, cooldown=BREAKER_COOLDOWN, why="")
+
+
+def lrclib_paused() -> float:
+    """Secondes avant la fin de la pause (0 si LRCLIB est interrogeable)."""
+    with _BRK_LOCK:
+        return max(0.0, _brk["until"] - time.monotonic())
+
+
+def _breaker_check() -> None:
+    with _BRK_LOCK:
+        left, why = _brk["until"] - time.monotonic(), _brk["why"]
+    if left > 0:
+        raise LrclibDeferred(f"reportée : LRCLIB ne répond plus ({why}), pause de {left:.0f} s")
+
+
+def _breaker_failure(why: str) -> None:
+    """Un échec de plus. Au-delà de BREAKER_FAILS d'affilée : plus aucune requête pendant un moment
+    (insister charge un serveur déjà saturé, et fait attendre pour rien)."""
+    with _BRK_LOCK:
+        _brk["fails"] += 1
+        _brk["why"] = why
+        if _brk["fails"] >= BREAKER_FAILS:
+            _brk["until"] = time.monotonic() + _brk["cooldown"]
+            _brk["cooldown"] = min(_brk["cooldown"] * 2, BREAKER_MAX)
+            _brk["fails"] = BREAKER_FAILS - 1        # à la reprise, un seul échec suffit à re-déclencher
+
+
+def _breaker_success() -> None:
+    with _BRK_LOCK:
+        _brk["fails"] = 0
+        _brk["cooldown"] = BREAKER_COOLDOWN
+
+
 def lrclib_request(path: str, params: Dict[str, str]):
     """GET sur l'API LRCLIB. Renvoie None si 404 (rien trouvé).
-    Réessaie tout seul : patiemment sur 429 / 503 (serveur qui freine), plus vite sur
-    les autres erreurs serveur ou réseau."""
+    Un seul réessai, court, sur les erreurs de saturation ou de réseau ; si LRCLIB enchaîne les
+    échecs, il est mis en pause (LrclibDeferred) au lieu d'être relancé sans fin."""
     url = f"{LRCLIB_URL}/{path}?" + urllib.parse.urlencode(params)
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/json"})
     last = "erreur inconnue"
-    attempts = 6
-    for attempt in range(attempts):
-        wait = 2 ** attempt                      # 1, 2, 4, 8, 16 s
+    for attempt in range(2):
+        _breaker_check()
         _throttle()
         try:
-            with url_open(req, timeout=20) as r:
+            with url_open(req, timeout=LRCLIB_TIMEOUT) as r:
                 data = json.loads(read_limited(r, MAX_JSON_BYTES).decode("utf-8"))
             _speed_up()
+            _breaker_success()
             return data
         except urllib.error.HTTPError as e:
             if e.code == 404:
                 _speed_up()
+                _breaker_success()
                 return None
             last = _http_error_message(e.code)
             if e.code not in (429, 500, 502, 503, 504):
-                break
-            if e.code in (429, 503):
-                pause = (2, 4, 8, 15, 25, 30)[attempt]
-                ra = e.headers.get("Retry-After") if e.headers else None
-                if ra and ra.strip().isdigit():
-                    pause = max(pause, min(int(ra), 60))
-                _slow_down(pause)            # l'attente se fait dans _throttle()
-                continue
+                raise LrclibError(last)                  # requête refusée : réessayer ne changera rien
+            pause = 3.0
+            ra = e.headers.get("Retry-After") if e.headers else None
+            if ra and ra.strip().isdigit():
+                pause = float(min(max(int(ra), 1), 10))
+            _breaker_failure(last)
+            _slow_down(pause)                            # l'attente se fait dans _throttle()
         except ValueError:
-            last = "réponse illisible de LRCLIB"
-        except OSError as e:                     # URLError, timeout, connexion coupée…
+            raise LrclibError("réponse illisible de LRCLIB")
+        except OSError as e:                             # URLError, délai dépassé, connexion coupée…
             last = "LRCLIB injoignable (" + (str(getattr(e, "reason", "") or e) or type(e).__name__) + ")"
-        if attempt < attempts - 1:
-            time.sleep(wait)
+            _breaker_failure(last)
+            if attempt == 0:
+                time.sleep(2)
     raise LrclibError(last)
+
+
+# ─── « introuvable » déjà vérifié : on ne repose pas la question pendant NOTFOUND_TTL_DAYS ───
+
+NOTFOUND_TTL_DAYS = 30
+NOTFOUND_FILE = os.path.join(_real_home(), ".cache", "musitag", "lrclib-introuvables.json")
+_NF_LOCK = threading.Lock()
+_nf: Optional[Dict[str, float]] = None
+_nf_dirty = False
+
+
+def _nf_key(title: str, artist: str, dur: float) -> str:
+    return f"{_norm(artist)}|{_norm(title)}|{int(round(dur or 0))}"
+
+
+def _nf_load() -> Dict[str, float]:
+    global _nf
+    if _nf is None:
+        try:
+            with open(NOTFOUND_FILE, encoding="utf-8") as fh:
+                raw = json.load(fh)
+            _nf = {str(k): float(v) for k, v in raw.items()} if isinstance(raw, dict) else {}
+        except (OSError, ValueError, TypeError, AttributeError):
+            _nf = {}
+    return _nf
+
+
+def notfound_checked(key: str) -> Optional[float]:
+    """Date (epoch) de la dernière vérification « introuvable », si elle est récente."""
+    with _NF_LOCK:
+        ts = _nf_load().get(key)
+    if ts and time.time() - ts < NOTFOUND_TTL_DAYS * 86400:
+        return ts
+    return None
+
+
+def notfound_remember(key: str) -> None:
+    global _nf_dirty
+    with _NF_LOCK:
+        _nf_load()[key] = time.time()
+        _nf_dirty = True
+
+
+def notfound_save() -> None:
+    global _nf_dirty
+    with _NF_LOCK:
+        if not _nf_dirty or _nf is None:
+            return
+        limit = time.time() - NOTFOUND_TTL_DAYS * 86400
+        keep = dict(sorted(((k, v) for k, v in _nf.items() if v >= limit), key=lambda kv: -kv[1])[:50000])
+        try:
+            os.makedirs(os.path.dirname(NOTFOUND_FILE), exist_ok=True)
+            tmp = NOTFOUND_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(keep, fh, ensure_ascii=False)
+            os.replace(tmp, NOTFOUND_FILE)
+            _nf_dirty = False
+        except OSError:
+            return
+    uid, gid = os.environ.get("SUDO_UID"), os.environ.get("SUDO_GID")
+    if os.geteuid() == 0 and uid and gid:            # lancé via sudo : le cache reste à l'utilisateur
+        for p in (os.path.dirname(NOTFOUND_FILE), NOTFOUND_FILE):
+            try:
+                os.chown(p, int(uid), int(gid))
+            except OSError:
+                pass
 
 
 def _norm(s: str) -> str:
@@ -1461,79 +1578,189 @@ def _acceptable(m: LyricsMatch, strict: bool = True) -> bool:
     return m.title_sim >= 0.85 and m.artist_sim >= 0.5
 
 
-def lrclib_lookup(af, title: Optional[str] = None, artist: Optional[str] = None) -> LyricsResult:
-    """Cherche les paroles d'un fichier : correspondance exacte d'abord
-    (titre + artiste + durée à ±2 s), puis recherche élargie.
-    Avec un titre/artiste tapé à la main, l'écart de durée n'élimine plus rien
-    (il reste affiché pour que tu juges)."""
-    strict = title is None and artist is None
+def _lookup_who(af, title: Optional[str], artist: Optional[str]):
     title = (af.first("title") if title is None else title).strip()
     artists = [artist] if artist else af.get("artist") + af.get("albumartist")
     artists = [a.strip() for a in dict.fromkeys(artists) if a and a.strip()]
-    album, dur = af.first("album"), af.length()
+    return title, artists
+
+
+def lookup_exact(af, title: Optional[str] = None, artist: Optional[str] = None) -> LyricsResult:
+    """1er temps : la correspondance exacte (titre + artiste + durée à ±2 s), une seule requête.
+    Renvoie un résultat définitif, ou « pending » (match = version « texte seul » éventuelle)
+    s'il faut chercher plus large."""
+    manual = title is not None or artist is not None
+    title, artists = _lookup_who(af, title, artist)
+    dur = af.length()
     if not title or not artists:
         return LyricsResult(af, "skip", message="titre ou artiste manquant")
-    main = artists[0]
+    if not manual:
+        ts = notfound_checked(_nf_key(title, artists[0], dur))
+        if ts:
+            return LyricsResult(af, "notfound", message=time.strftime("introuvable, déjà vérifié le %d/%m",
+                                                                     time.localtime(ts)))
     try:
-        # 1) correspondance exacte
         rec = None
         if dur:
-            params = {"track_name": title, "artist_name": main, "duration": str(round(dur))}
-            if album:
-                rec = lrclib_request("get", {**params, "album_name": album})
-            if rec is None:
-                rec = lrclib_request("get", params)
-        exact_m = None
+            rec = lrclib_request("get", {"track_name": title, "artist_name": artists[0],
+                                         "duration": str(round(dur))})
         if isinstance(rec, dict):
+            m = _evaluate(rec, title, artists, dur, exact=True)
             if rec.get("instrumental"):
-                m = _evaluate(rec, title, artists, dur, exact=True)
                 return LyricsResult(af, "instrumental", m, [m])
-            exact_m = _evaluate(rec, title, artists, dur, exact=True)
-            if exact_m.kind == "synced":
-                return LyricsResult(af, "exact", exact_m, [exact_m])
-            if not exact_m.kind:
-                exact_m = None
-
-        # 2) recherche élargie (ou version synchronisée d'un résultat « texte seul »)
-        bt = base_title(title)
-        queries = [{"track_name": bt, "artist_name": main}, {"q": f"{main} {bt}"}, {"track_name": bt}]
-        seen = {exact_m.rec.get("id")} if exact_m else set()
-        found: List[LyricsMatch] = []
-        instrumental = None
-        for q in queries:
-            res = lrclib_request("search", q) or []
-            for r in res if isinstance(res, list) else []:
-                if not isinstance(r, dict) or r.get("id") in seen:
-                    continue
-                seen.add(r.get("id"))
-                m = _evaluate(r, title, artists, dur)
-                if not _acceptable(m, strict):
-                    continue
-                if r.get("instrumental") or not m.kind:
-                    if r.get("instrumental") and m.diff is not None and m.diff <= 3:
-                        instrumental = instrumental or m
-                    continue
-                found.append(m)
-            if found:
-                break
-        found.sort(key=lambda m: -m.score)
-
-        if exact_m:
-            for m in found:     # même morceau, même durée, mais synchronisé : on prend
-                if (m.kind == "synced" and m.diff is not None and m.diff <= 2
-                        and m.title_sim >= 0.95 and m.artist_sim >= 0.8):
-                    m.exact = True
-                    return LyricsResult(af, "exact", m, [m, exact_m] + [x for x in found if x is not m][:6])
-            return LyricsResult(af, "exact", exact_m, [exact_m] + found[:7])
-        if found:
-            return LyricsResult(af, "approx", found[0], found[:8])
-        if instrumental:
-            return LyricsResult(af, "instrumental", instrumental, [instrumental])
-        return LyricsResult(af, "notfound")
+            if m.kind == "synced":
+                return LyricsResult(af, "exact", m, [m])
+            if m.kind:
+                return LyricsResult(af, "pending", m)        # texte seul : on cherche une version synchronisée
+        return LyricsResult(af, "pending")
     except LrclibError as e:
         return LyricsResult(af, "error", message=str(e))
     except Exception as e:
         return LyricsResult(af, "error", message=str(e) or type(e).__name__)
+
+
+def album_pool(artist: str, album: str) -> list:
+    """Une recherche pour tout un album (jusqu'à 20 résultats), partagée entre ses morceaux ;
+    sans l'artiste en secours (artiste crédité autrement : « SIDxRAM » pour « RAM »…)."""
+    alb = base_title(album) or album
+    for q in (f"{artist} {alb}", alb if len(alb) >= 4 else ""):
+        if not q:
+            continue
+        try:
+            res = lrclib_request("search", {"q": q}) or []
+        except LrclibError:
+            return []
+        res = [r for r in res if isinstance(r, dict)] if isinstance(res, list) else []
+        if res:
+            return res
+    return []
+
+
+def lookup_wide(af, exact_m: Optional[LyricsMatch] = None, pool: Optional[list] = None,
+                title: Optional[str] = None, artist: Optional[str] = None) -> LyricsResult:
+    """2e temps : d'abord parmi les résultats de l'album (pool, sans requête), puis une recherche
+    pour ce morceau. Sans album (pool None), une dernière sans l'artiste si LRCLIB n'a rien renvoyé :
+    avec un album, la recherche de secours sans artiste a déjà été faite une fois pour tous."""
+    manual = title is not None or artist is not None
+    strict = not manual
+    title, artists = _lookup_who(af, title, artist)
+    dur = af.length()
+    main, bt = artists[0], base_title(title)
+    seen = {exact_m.rec.get("id")} if exact_m else set()
+    found: List[LyricsMatch] = []
+    instrumental = [None]
+
+    def consider(records) -> None:
+        for r in records if isinstance(records, list) else []:
+            if not isinstance(r, dict) or r.get("id") in seen:
+                continue
+            seen.add(r.get("id"))
+            m = _evaluate(r, title, artists, dur)
+            if not _acceptable(m, strict):
+                continue
+            if r.get("instrumental") or not m.kind:
+                if r.get("instrumental") and m.diff is not None and m.diff <= 3:
+                    instrumental[0] = instrumental[0] or m
+                continue
+            found.append(m)
+
+    def synced_twin() -> Optional[LyricsMatch]:
+        """Le même morceau, même durée, en version synchronisée (le « get » n'avait que du texte)."""
+        for m in sorted(found, key=lambda m: -m.score):
+            if (m.kind == "synced" and m.diff is not None and m.diff <= 2
+                    and m.title_sim >= 0.95 and m.artist_sim >= 0.8):
+                return m
+        return None
+
+    try:
+        if pool:
+            consider(pool)
+        if not found or (exact_m and not synced_twin()):
+            res = lrclib_request("search", {"track_name": bt, "artist_name": main}) or []
+            consider(res)
+            if not res and not found and not exact_m and pool is None:
+                consider(lrclib_request("search", {"track_name": bt}) or [])   # artiste crédité autrement
+    except LrclibError as e:
+        if exact_m:                     # on a déjà une version texte exacte : on s'en contente
+            return LyricsResult(af, "exact", exact_m, [exact_m])
+        return LyricsResult(af, "error", message=str(e))
+    except Exception as e:
+        return LyricsResult(af, "error", message=str(e) or type(e).__name__)
+    found.sort(key=lambda m: -m.score)
+    if exact_m:
+        twin = synced_twin()
+        if twin:
+            twin.exact = True
+            return LyricsResult(af, "exact", twin, [twin, exact_m] + [x for x in found if x is not twin][:6])
+        return LyricsResult(af, "exact", exact_m, [exact_m] + found[:7])
+    if found:
+        return LyricsResult(af, "approx", found[0], found[:8])
+    if instrumental[0]:
+        return LyricsResult(af, "instrumental", instrumental[0], [instrumental[0]])
+    if not manual:
+        notfound_remember(_nf_key(title, main, dur))
+    return LyricsResult(af, "notfound")
+
+
+def lrclib_lookup(af, title: Optional[str] = None, artist: Optional[str] = None) -> LyricsResult:
+    """Paroles d'un seul morceau : correspondance exacte, puis recherche élargie.
+    Avec un titre/artiste tapé à la main, l'écart de durée n'élimine plus rien
+    (il reste affiché pour que tu juges), et le cache des « introuvable » est ignoré."""
+    r = lookup_exact(af, title, artist)
+    if r.status == "pending":
+        r = lookup_wide(af, r.match, None, title, artist)
+    notfound_save()
+    return r
+
+
+def lyrics_search(files, pmap, on_result) -> None:
+    """Paroles de plusieurs morceaux, en ménageant LRCLIB :
+      1. la correspondance exacte de chaque morceau (1 requête chacun) ;
+      2. pour ceux qui restent, UNE recherche par album, partagée entre ses morceaux ;
+      3. en dernier recours, une recherche pour le morceau.
+    pmap(fn, éléments, rappel) exécute fn en parallèle et appelle rappel(j, résultat) au fil de
+    l'eau ; on_result(i, LyricsResult) reçoit chaque résultat définitif."""
+    def as_result(i: int, r) -> LyricsResult:
+        if isinstance(r, LyricsResult):
+            return r
+        return LyricsResult(files[i], "error", message=str(r) or type(r).__name__)
+
+    pending: List[Tuple[int, LyricsResult]] = []
+    try:
+        def first(j: int, r) -> None:
+            r = as_result(j, r)
+            if r.status == "pending":
+                pending.append((j, r))
+            else:
+                on_result(j, r)
+
+        pmap(lookup_exact, list(files), first)
+        if not pending:
+            return
+        groups: Dict[Tuple[str, str, str], List[int]] = {}
+        for k, (i, _) in enumerate(pending):
+            af = files[i]
+            artist = af.first("albumartist") or af.first("artist")
+            album = af.first("album")
+            if artist and album:
+                groups.setdefault((af.dir, artist, album), []).append(k)
+        pools: Dict[int, list] = {}
+        keys = list(groups)
+
+        def got_pool(j: int, res) -> None:
+            for k in groups[keys[j]]:
+                pools[k] = res if isinstance(res, list) else []
+
+        if keys:
+            pmap(lambda key: album_pool(key[1], key[2]), keys, got_pool)
+        jobs = [(files[i], r.match, pools.get(k)) for k, (i, r) in enumerate(pending)]
+
+        def second(j: int, r) -> None:
+            on_result(pending[j][0], as_result(pending[j][0], r))
+
+        pmap(lambda job: lookup_wide(*job), jobs, second)
+    finally:
+        notfound_save()
 
 
 def lrclib_ping() -> Optional[str]:
@@ -1552,30 +1779,25 @@ def lrclib_ping() -> Optional[str]:
 def lyrics_fetch_all(files) -> List[LyricsResult]:
     results: List[Optional[LyricsResult]] = [None] * len(files)
     prog = make_progress() if console.is_terminal else _NullProgress()
-    ex = ThreadPoolExecutor(max_workers=LRCLIB_WORKERS)
-    streak, aborted = 0, False
-    try:
-        with prog:
-            task = prog.add_task("Recherche sur LRCLIB", total=len(files))
-            futs = {ex.submit(lrclib_lookup, af): i for i, af in enumerate(files)}
+
+    def pmap(fn, items, callback) -> None:
+        with ThreadPoolExecutor(max_workers=LRCLIB_WORKERS) as ex:
+            futs = {ex.submit(fn, it): j for j, it in enumerate(items)}
             for fut in as_completed(futs):
-                i = futs[fut]
-                if fut.cancelled():
-                    results[i] = LyricsResult(files[i], "error", message="recherche interrompue")
-                else:
-                    try:
-                        results[i] = fut.result()
-                    except Exception as e:
-                        results[i] = LyricsResult(files[i], "error", message=str(e) or type(e).__name__)
-                # LRCLIB ne répond plus : on arrête au lieu d'attendre chaque fichier
-                streak = streak + 1 if results[i].status == "error" else 0
-                if streak >= 8 and not aborted:
-                    aborted = True
-                    for f in futs:
-                        f.cancel()
-                prog.advance(task)
-    finally:
-        ex.shutdown(wait=False, cancel_futures=True)
+                try:
+                    r = fut.result()
+                except Exception as e:
+                    r = e
+                callback(futs[fut], r)
+
+    with prog:
+        task = prog.add_task("Recherche sur LRCLIB", total=len(files))
+
+        def done(i: int, r: LyricsResult) -> None:
+            results[i] = r
+            prog.advance(task)
+
+        lyrics_search(files, pmap, done)
     return results  # type: ignore
 
 
@@ -2273,7 +2495,7 @@ def result_cells(r: LyricsResult):
     elif r.status == "approx" or (r.status == "instrumental" and r.match):
         corr = Text("approx · ", style="bold yellow")
         corr.append(r.match.describe())
-    elif r.status in ("skip", "error"):
+    elif r.status in ("skip", "error") or (r.status == "notfound" and r.message):
         corr = Text(r.message, style="red" if r.status == "error" else "dim")
     else:
         corr = Text("")
@@ -2330,7 +2552,7 @@ def lyrics_counts(results: List[LyricsResult]) -> Text:
     if c.get("skip"):
         t.append(f"  ·  {c['skip']} ignoré(s)", style="dim")
     if c.get("error"):
-        t.append(f"  ·  {c['error']} erreur(s)", style="bold red")
+        t.append(f"  ·  {c['error']} en erreur ou reportée(s)", style="bold red")
     return t
 
 
@@ -2360,8 +2582,8 @@ def batch_lyrics(files) -> None:
         err_idx = [i for i, r in enumerate(results) if r.status == "error"]
         if not err_idx:
             break
-        k = menu(f"{len(err_idx)} recherche(s) en erreur", [
-            ("1", "Relancer ces recherches", "LRCLIB était surchargé : ça passe en général au 2e essai"),
+        k = menu(f"{len(err_idx)} recherche(s) en erreur ou reportée(s)", [
+            ("1", "Relancer ces recherches", "LRCLIB saturait : musitag attend la fin de sa pause, puis réessaie"),
             ("2", "Continuer sans elles", "ces fichiers ne seront pas modifiés"),
             ("0", "Annuler", "rien n'est écrit"),
         ])
@@ -2369,8 +2591,15 @@ def batch_lyrics(files) -> None:
             return
         if k == "2":
             break
-        with console.status("[magenta]Petite pause pour laisser souffler LRCLIB…[/]", spinner="dots"):
-            time.sleep(5)
+        try:
+            with console.status("[magenta]Petite pause pour laisser souffler LRCLIB…[/]", spinner="dots") as st:
+                time.sleep(3)
+                while lrclib_paused() > 0:
+                    st.update(f"[magenta]LRCLIB saturait : nouvel essai dans {lrclib_paused():.0f} s…[/] "
+                              "[dim](Ctrl+C pour abandonner)[/]")
+                    time.sleep(0.5)
+        except KeyboardInterrupt:
+            continue
         retry = lyrics_fetch_all([results[i].af for i in err_idx])
         for i, r in zip(err_idx, retry):
             results[i] = r
@@ -4811,13 +5040,10 @@ def plan_paroles(ctx: RunCtx, al: AlbumPlan, st: Step) -> str:
         ctx.cache["lrclib_down"] = _await(ctx, lrclib_ping)
     if ctx.cache["lrclib_down"]:
         raise StepFailed(f"LRCLIB injoignable ({ctx.cache['lrclib_down']})")
-    c = dict(exact=0, approx=0, instrumental=0, ignored=0, notfound=0, error=0)
-    streak = [0]
+    c = dict(exact=0, approx=0, instrumental=0, ignored=0, notfound=0, checked=0, error=0)
 
-    def done(i: int, r) -> None:
+    def done(i: int, r: LyricsResult) -> None:
         d = todo[i]
-        if not isinstance(r, LyricsResult):
-            r = LyricsResult(d, "error", message=str(r) or type(r).__name__)
         text, why = None, ""
         if r.status == "exact":
             text, why = r.match.text, "exacte" + (" (synchronisée)" if r.match.kind == "synced" else " (texte)")
@@ -4835,23 +5061,26 @@ def plan_paroles(ctx: RunCtx, al: AlbumPlan, st: Step) -> str:
                 why = "instrumental (rien écrit)"
         elif r.status == "error":
             c["error"] += 1
-            why = "erreur : " + r.message
+            why = r.message if r.message.startswith("reportée") else "reportée : " + r.message
         else:
             c["notfound"] += 1
+            c["checked"] += r.message.startswith("introuvable, déjà")
             why = r.message or "introuvable"
         if text:
             c["instrumental" if text == INSTRUMENTAL_TEXT else r.status] += 1
             d.set("lyrics", [text.strip()])
         ctx.log(f"{d.name} : {why}")
-        streak[0] = streak[0] + 1 if r.status == "error" else 0
-        if streak[0] >= 8:
-            raise StepFailed("LRCLIB ne répond plus (8 erreurs de suite)")
 
-    _await_many(ctx, lrclib_lookup, todo, LRCLIB_WORKERS, done)
+    try:
+        lyrics_search(todo, lambda fn, items, cb: _await_many(ctx, fn, items, LRCLIB_WORKERS, cb), done)
+    finally:
+        ctx.cache["deferred"] = ctx.cache.get("deferred", 0) + c["error"]
     found = c["exact"] + c["approx"] + c["instrumental"]
-    parts = [f"{n} {lab}" for n, lab in ((c["exact"], "exacte(s)"), (c["approx"], "approchante(s)"),
-                                          (c["instrumental"], "instrumental(aux)"), (c["ignored"], "ignorée(s)"),
-                                          (c["notfound"], "introuvable(s)"), (c["error"], "en erreur")) if n]
+    nf = f"{c['notfound']} introuvable(s)" + (f" (dont {c['checked']} déjà vérifié(s))" if c["checked"] else "")
+    parts = [f"{n} {lab}" if lab else nf
+             for n, lab in ((c["exact"], "exacte(s)"), (c["approx"], "approchante(s)"),
+                            (c["instrumental"], "instrumental(aux)"), (c["ignored"], "ignorée(s)"),
+                            (c["notfound"], ""), (c["error"], "reportée(s) : LRCLIB ne répondait plus")) if n]
     summary = ", ".join(parts)
     if not found:
         raise StepFailed("aucune parole retenue" + (f" ({summary})" if summary else ""))
@@ -5541,6 +5770,12 @@ def run_script(sc: Script, targets, verbose: bool = False, simulation: bool = Fa
     not_started = n_alb - len(albums)
 
     tot = show_bilan(albums, not_started)
+    deferred = ctx.cache.get("deferred", 0)
+    if deferred:
+        info(f"Paroles : [bold]{deferred}[/] recherche(s) reportée(s), LRCLIB ne répondait plus (serveur saturé).\n"
+             "Relance le même script plus tard : avec « paroles déjà présentes : garder », seuls les "
+             "morceaux encore sans paroles seront cherchés, et les introuvables déjà vérifiés ne le "
+             "seront pas à nouveau.", "yellow")
     if not (tot["fichiers"] or tot["crees"] or tot["suppr"]):
         info("Rien à modifier : tout est déjà comme le script le demande.", "green")
         return 0
