@@ -19,6 +19,8 @@ sans fichier annexe.
   FLAC taguées, au sample près, avec détection automatique de l'encodage du `.cue`.
 - **Nettoyage** : suppression des fichiers annexes d'un album (scans, `.cue`, `.m3u`, `.log`…),
   après intégration de la pochette et des paroles `.lrc` dans les morceaux.
+- **Scripts** : enchaînement d'actions défini sans code, depuis musitag, puis rejoué sur un
+  album, un dossier entier ou un seul morceau avec `musitag -s NOM`.
 - **Sécurité des données** : aucune modification n'est écrite sans aperçu avant / après et
   confirmation.
 
@@ -83,6 +85,7 @@ images CD.
 | `musitag CHEMIN` | ouvre le dossier indiqué |
 | `musitag -r CHEMIN` | inclut les sous-dossiers (mode récursif) |
 | `musitag -n CHEMIN` | ce dossier uniquement (comportement par défaut) |
+| `musitag -s NOM [CHEMIN]` | lance un script (voir [Scripts](#scripts)) |
 | `musitag --version` | affiche la version installée |
 | `musitag --help` | affiche l'aide |
 
@@ -106,6 +109,7 @@ dossier musique n'est trouvé, il ouvre le dossier personnel et l'indique au dé
 | `4` | Modifier tous les fichiers : outils en lot (voir ci-dessous) |
 | `5` | Découper une image CD à l'aide de son `.cue` |
 | `6` | Nettoyer le dossier : supprimer tout ce qui n'est pas de la musique |
+| `s` | Scripts : créer, modifier, lancer (voir [Scripts](#scripts)) |
 | `o` | Ouvrir un dossier : navigation Musique → Artiste → Album |
 | `d` | Saisir un chemin (complétion avec Tab) |
 | `p` | Définir le dossier courant comme dossier musique |
@@ -154,6 +158,67 @@ ignoré par Jellyfin et par musitag, supprimée, ou laissée en place.
 Le menu 6 liste tous les fichiers qui ne sont pas de la musique. Ils peuvent être supprimés en
 totalité, au choix ou par type. Avant suppression, la pochette du dossier et les paroles `.lrc`
 sont intégrées aux morceaux qui n'en ont pas.
+
+### Scripts
+
+Un script enchaîne des actions sur un album, sans intervention : par exemple chercher les
+paroles exactes, intégrer la pochette du dossier ou, à défaut, le premier résultat en ligne,
+retirer « (Remaster) » des titres, renommer les fichiers puis nettoyer le dossier.
+
+**Créer un script.** Touche **s** du menu principal, puis **Nouveau script**. Les étapes
+s'ajoutent une par une en choisissant une action dans une liste, puis ses réglages dans de
+petits menus ; elles peuvent ensuite être modifiées, déplacées ou supprimées. Chaque script est
+enregistré dans `~/.config/musitag/scripts/NOM.mst`, un fichier texte lisible qui peut aussi
+être modifié à la main ou partagé.
+
+**Lancer un script.**
+
+| Commande | Effet |
+|---|---|
+| `musitag -s NOM` | l'album du dossier courant |
+| `musitag -s NOM CHEMIN` | l'album indiqué, ou un seul morceau si `CHEMIN` est un fichier |
+| `musitag -s NOM -r CHEMIN` | chaque album situé sous `CHEMIN`, l'un après l'autre |
+| `musitag -s NOM -v` | mode verbeux : chaque action est décrite en temps réel |
+| `musitag -s NOM --simulation` | affiche le bilan sans rien écrire |
+
+`NOM` peut aussi être le chemin d'un fichier `.mst`. Un script se lance également depuis le menu
+**s**, sur le dossier ouvert ou sur un morceau choisi.
+
+**Déroulement.** Toutes les étapes sont d'abord préparées, sans rien écrire. Un bilan présente
+ensuite l'ensemble des modifications, suivi d'**une seule confirmation** avant l'écriture. Sur
+plusieurs albums, le bilan se limite à un résumé par album, et le détail complet reste
+consultable. Un avertissement s'affiche avant tout lancement sur au moins dix albums ou sur la
+racine de la bibliothèque.
+
+| Touche, pendant l'exécution | Effet |
+|---|---|
+| `s` | passe l'étape en cours (une recherche trop longue, par exemple) ; ce qui était déjà trouvé est conservé |
+| `q` | arrête la préparation et passe au bilan de ce qui est prêt ; pendant l'écriture, s'arrête après le fichier en cours |
+| `v` | active ou désactive le mode verbeux |
+
+**Actions disponibles.**
+
+| Action | Réglages |
+|---|---|
+| Chercher les paroles | correspondances exactes seulement, ou la première trouvée ; paroles existantes remplacées ou conservées ; mention instrumentale |
+| Marquer comme instrumental | paroles existantes remplacées ou conservées |
+| Supprimer les paroles | — |
+| Intégrer une pochette | sources classées par priorité : pochette déjà intégrée, image du dossier, 1er à 5e résultat en ligne |
+| Supprimer les pochettes intégrées | — |
+| Fixer des champs | un ou plusieurs champs et leur valeur |
+| Supprimer des champs | liste de champs (`comment`, `encodeur`, ou un nom exact) |
+| Numéroter les pistes | d'après les noms de fichiers ou dans l'ordre ; total des pistes |
+| Titres d'après les noms de fichiers | — |
+| Rechercher / remplacer | champ, texte recherché, remplacement, expression régulière |
+| Effacer tous les tags | — |
+| Renommer les fichiers | modèle (`{n} - {title}`, etc.) |
+| Nettoyer le dossier | tout, ou certains types de fichiers |
+| Découper l'image CD | image d'origine rangée dans `_source`, supprimée ou laissée en place |
+
+Chaque étape qui peut échouer (aucune parole retenue, aucune pochette trouvée…) a sa propre
+règle : passer à l'étape suivante, ou arrêter le script pour cet album. Les actions propres à un
+album entier (numérotation, nettoyage, découpage) sont ignorées lorsque le script vise un seul
+morceau.
 
 ### Droits d'accès
 
@@ -210,5 +275,6 @@ programmes.
 | 1.5.1 | Détection plus fiable de l'encodage des `.cue` |
 | 1.5.2 | Correctifs de sécurité, installation et mise à jour par `git` |
 | 1.5.3 | Installation : détection d'un dépôt cloné dans `/usr/local/bin` |
+| 1.6 | Scripts : enchaînements d'actions sans code, lancés avec `musitag -s` |
 
 Le détail de chaque version figure dans [CHANGELOG.md](CHANGELOG.md).

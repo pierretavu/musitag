@@ -1,5 +1,20 @@
 # Journal des versions
 
+## 1.6 — 18 octobre 2026
+- **Scripts** : enchaînements d'actions créés sans code depuis musitag (touche **s**) et
+  enregistrés dans `~/.config/musitag/scripts/NOM.mst`.
+  - Lancement : `musitag -s NOM`, sur l'album du dossier courant, un autre album, un seul
+    morceau, ou chaque album d'un dossier (`-r`).
+  - 14 actions : paroles (exactes ou première trouvée), mention instrumentale, pochette par
+    ordre de priorité (intégrée, dossier, résultats en ligne), champs, numérotation, titres,
+    rechercher / remplacer, renommage, nettoyage, découpage d'image CD…
+  - Tout est préparé avant d'écrire : bilan, puis une seule confirmation. Bilan résumé par
+    album sur les gros lancements, avertissement avant un lancement sur au moins dix albums ou
+    sur la racine de la bibliothèque.
+  - Pendant l'exécution : `s` saute l'étape en cours, `q` arrête, `v` active le mode verbeux.
+    Options `-v` (verbeux) et `--simulation` (bilan sans écriture).
+  - Règle par étape en cas d'échec : passer à la suivante, ou arrêter le script pour cet album.
+
 ## 1.5.3 — 18 octobre 2026
 - Installation : si le dépôt a été cloné dans `/usr/local/bin` (l'emplacement de la commande
   `musitag`), l'installeur s'arrête aussitôt et indique comment le déplacer ; la

@@ -51,7 +51,7 @@ _VENDOR_DIR = "/opt/musitag/lib"
 if os.path.isdir(_VENDOR_DIR) and _VENDOR_DIR not in sys.path:
     sys.path.insert(0, _VENDOR_DIR)
 
-VERSION = "1.5.3"
+VERSION = "1.6"
 
 
 def install_cmd(*pkgs_by_distro: str) -> str:
@@ -1801,7 +1801,7 @@ def op_set(af: AudioFile, f: str, values: List[str]) -> Optional[Op]:
     return Op(af, "set", f, new, join_values(old), join_values(new), LABEL[f])
 
 
-def preview(ops: List[Op], limit: int = 60) -> None:
+def ops_table(ops: List[Op], limit: int = 60) -> Table:
     t = Table(box=box.SIMPLE_HEAD, header_style="bold magenta", expand=True, pad_edge=False)
     t.add_column("Fichier", ratio=3, no_wrap=True, overflow="ellipsis", style="dim")
     t.add_column("Champ", no_wrap=True, style="cyan")
@@ -1815,7 +1815,11 @@ def preview(ops: List[Op], limit: int = 60) -> None:
         before = Text(op.before, style="red") if op.before else Text("—", style="dim")
         after = Text(op.after, style="bold green") if op.after else Text("(supprimé)", style="dim red")
         t.add_row(name, Text(op.label), before, "→", after)
-    console.print(t)
+    return t
+
+
+def preview(ops: List[Op], limit: int = 60) -> None:
+    console.print(ops_table(ops, limit))
     if len(ops) > limit:
         console.print(f"[dim]… et {len(ops) - limit} autres modifications[/]")
     nfiles = len({id(o.af) for o in ops})
@@ -3175,6 +3179,18 @@ def cue_track_form(cs: CueSheet) -> None:
     t.performer = ask(field_prompt("Artiste"), prefill=t.performer).strip()
 
 
+def guess_disc(cs: CueSheet, cues: List[str]) -> None:
+    """N° de disque deviné depuis le nom (« CD2 », « Disc 2 »…) et nombre de .cue du dossier."""
+    if not cs.disc:
+        m = re.search(r"(?:cd|disc|disk|disque)\s*[_.-]?\s*(\d{1,2})",
+                      os.path.basename(cs.path) + " " + " ".join(t.file for t in cs.tracks), re.I)
+        if m:
+            cs.disc = str(int(m.group(1)))
+    same_dir = [c for c in cues if os.path.dirname(c) == os.path.dirname(cs.path)]
+    if cs.disc and not cs.totaldiscs and len(same_dir) > 1:
+        cs.totaldiscs = str(len(same_dir))
+
+
 def cue_flow(app) -> None:
     if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
         info("Le découpage CUE a besoin de ffmpeg :\n\n    [bold]"
@@ -3206,15 +3222,7 @@ def cue_flow(app) -> None:
         info("Ce .cue ne contient aucune piste audio exploitable.", "red")
         pause()
         return
-    # n° de disque deviné depuis le nom (« CD2 », « Disc 2 »…) et nombre de .cue du dossier
-    if not cs.disc:
-        m = re.search(r"(?:cd|disc|disk|disque)\s*[_.-]?\s*(\d{1,2})",
-                      os.path.basename(path) + " " + " ".join(t.file for t in cs.tracks), re.I)
-        if m:
-            cs.disc = str(int(m.group(1)))
-    same_dir = [c for c in cues if os.path.dirname(c) == os.path.dirname(path)]
-    if cs.disc and not cs.totaldiscs and len(same_dir) > 1:
-        cs.totaldiscs = str(len(same_dir))
+    guess_disc(cs, cues)
 
     sources: Dict[str, str] = {}
     for fname in dict.fromkeys(t.file for t in cs.tracks):
@@ -3319,30 +3327,43 @@ def run_split(app, cs: CueSheet, sources, probes) -> bool:
     return True
 
 
+def move_originals(cs: CueSheet, srcs: List[str], mode: str) -> Optional[str]:
+    """Image CD d'origine + .cue : « ranger » (dans _source/, ignoré), « supprimer » ou « laisser ».
+    Renvoie None si tout va bien, sinon l'erreur."""
+    files = srcs + [cs.path]
+    try:
+        if mode == "ranger":
+            dest = os.path.join(os.path.dirname(cs.path), "_source")
+            os.makedirs(dest, exist_ok=True)
+            open(os.path.join(dest, ".ignore"), "a").close()
+            for f in files:
+                shutil.move(f, os.path.join(dest, os.path.basename(f)))
+        elif mode == "supprimer":
+            for f in files:
+                os.remove(f)
+    except PermissionError:
+        return "permission refusée — relance musitag avec sudo"
+    except OSError as e:
+        return str(e)
+    return None
+
+
 def handle_originals(cs: CueSheet, srcs: List[str]) -> None:
     key = menu("Que faire de l'image CD d'origine ?", [
         ("1", "La ranger dans « _source »", "sous-dossier ignoré par Jellyfin et musitag (.ignore)"),
         ("2", "La supprimer", "le .cue et " + ", ".join(os.path.basename(s) for s in srcs)),
         ("3", "La laisser en place", "Jellyfin verra l'album en double"),
     ])
-    files = srcs + [cs.path]
-    try:
-        if key == "1":
-            dest = os.path.join(os.path.dirname(cs.path), "_source")
-            os.makedirs(dest, exist_ok=True)
-            open(os.path.join(dest, ".ignore"), "a").close()
-            for f in files:
-                shutil.move(f, os.path.join(dest, os.path.basename(f)))
-            console.print("[green]✓ Rangé dans « _source/ ».[/]")
-        elif key == "2":
-            if confirm("Supprimer définitivement ces fichiers ?", False):
-                for f in files:
-                    os.remove(f)
-                console.print("[green]✓ Supprimé.[/]")
-    except PermissionError:
-        console.print("[red]Permission refusée — relance musitag avec sudo.[/]")
-    except OSError as e:
-        console.print(f"[red]Erreur : {escape(str(e))}[/]")
+    mode = {"1": "ranger", "2": "supprimer"}.get(key, "laisser")
+    if mode == "supprimer" and not confirm("Supprimer définitivement ces fichiers ?", False):
+        mode = "laisser"
+    err = move_originals(cs, srcs, mode)
+    if err:
+        console.print(f"[red]Erreur : {escape(err)}[/]")
+    elif mode == "ranger":
+        console.print("[green]✓ Rangé dans « _source/ ».[/]")
+    elif mode == "supprimer":
+        console.print("[green]✓ Supprimé.[/]")
     pause()
 
 
@@ -3985,9 +4006,9 @@ def rescue_ops(selected: List[CleanItem]) -> List[Op]:
     return ops
 
 
-def delete_items(items: List[CleanItem]):
+def delete_items(items: List[CleanItem], progress: bool = True):
     ok, errors = 0, []
-    prog = make_progress() if len(items) > 8 and console.is_terminal else _NullProgress()
+    prog = make_progress() if progress and len(items) > 8 and console.is_terminal else _NullProgress()
     with prog:
         task = prog.add_task("Suppression", total=len(items))
         for it in items:
@@ -4084,6 +4105,1837 @@ def clean_flow(app) -> None:
                       "concernés pour qu'il reprenne la pochette intégrée.[/]")
     pause()
     app.rescan()
+
+
+# ═════════════════════════════════════ Scripts ════════════════════════════════════
+# Un script (.mst) enchaîne des actions sur un album, sans intervention. Rien n'est écrit
+# pendant qu'il tourne : chaque étape PRÉPARE ses changements sur un « brouillon » de chaque
+# morceau (Draft) ; à la fin, un bilan et UNE confirmation, puis l'écriture.
+# Pendant qu'il tourne : s = sauter l'étape en cours, q = arrêter (bilan de ce qui est prêt),
+# v = verbeux oui / non.
+
+SCRIPT_EXT = ".mst"
+SCRIPTS_DIR = os.path.join(os.path.dirname(USER_CONFIG), "scripts")
+BIG_RUN = 10                # à partir de ce nombre d'albums : avertissement avant de lancer
+ONLINE_PICKS = 5            # sources « en ligne, 1er … 5e résultat »
+
+
+class ScriptError(Exception):
+    """Script introuvable ou illisible (message prêt à afficher)."""
+
+
+class StepSkipped(Exception):
+    """Touche s (ou q) pendant une étape."""
+
+
+class StepFailed(Exception):
+    """L'étape n'a rien pu faire (message prêt à afficher)."""
+
+
+@dataclass
+class OptSpec:
+    key: str
+    label: str
+    choices: Optional[List[Tuple[str, str]]] = None     # (valeur, libellé) ; None = texte libre
+    default: str = ""
+    multi: bool = False                                 # liste ordonnée, séparée par des virgules
+
+
+@dataclass
+class ActionSpec:
+    key: str
+    label: str
+    hint: str
+    group: str
+    opts: List[OptSpec] = dc_field(default_factory=list)
+    album_only: bool = False      # n'a pas de sens sur un morceau seul (nettoyage, découpage…)
+    can_fail: bool = False        # peut « échouer » : on règle alors quoi faire ensuite
+    free_keys: bool = False       # [champs] : chaque clé est un nom de champ
+
+
+FAIL_CHOICES = [("continuer", "passer à l'étape suivante"),
+                ("arreter", "arrêter le script pour cet album")]
+YES_NO = [("oui", "oui"), ("non", "non")]
+EXISTING = [("remplacer", "les remplacer"), ("garder", "les garder")]
+COVER_SOURCES = ([("garder", "la pochette déjà intégrée"), ("dossier", "l'image du dossier (cover.jpg…)")]
+                 + [(f"en_ligne_{i}", f"en ligne, {i}{'er' if i == 1 else 'e'} résultat")
+                    for i in range(1, ONLINE_PICKS + 1)])
+CLEAN_TYPES = [("image", "Image"), ("cue", "CUE"), ("playlist", "Playlist"), ("lrc", "Paroles .lrc"),
+               ("texte", "Texte / log"), ("controle", "Contrôle"), ("video", "Vidéo"),
+               ("archive", "Archive"), ("temporaire", "Temporaire"), ("systeme", "Système"),
+               ("dossier", "Dossier"), ("autre", "Autre")]
+CLEAN_TYPE_KIND = dict(CLEAN_TYPES)
+RENAME_PRESETS = [("{n} - {title}", "01 - Titre"), ("{n}. {title}", "01. Titre"),
+                  ("{disc}-{n} - {title}", "1-01 - Titre (multi-disques)"),
+                  ("{n} - {artist} - {title}", "01 - Artiste - Titre")]
+# noms usuels → clés réelles selon le format (Vorbis, ID3, MP4, APE, WMA)
+FIELD_ALIASES = {
+    "encodeur": ("ENCODER", "ENCODEDBY", "ENCODED-BY", "ENCODED_BY", "ENCODERSETTINGS",
+                 "ENCODER_SETTINGS", "TSSE", "TENC", "©too", "WM/EncodedBy", "WM/EncodingSettings"),
+}
+
+ACTIONS = [
+    ActionSpec("paroles", "Chercher les paroles", "LRCLIB, synchronisées si possible", "Paroles", [
+        OptSpec("accepter", "Accepter", [("exactes", "les correspondances exactes seulement"),
+                                         ("premieres", "la première trouvée, même approchante")], "exactes"),
+        OptSpec("existantes", "Paroles déjà présentes", EXISTING, "remplacer"),
+        OptSpec("instrumental", "Morceaux instrumentaux",
+                [("oui", f"écrire « {INSTRUMENTAL_TEXT} »"), ("non", "ne rien écrire")], "oui"),
+    ], can_fail=True),
+    ActionSpec("instrumental", "Marquer comme instrumental", f"« {INSTRUMENTAL_TEXT} »", "Paroles", [
+        OptSpec("existantes", "Paroles déjà présentes", EXISTING, "remplacer"),
+    ]),
+    ActionSpec("sans_paroles", "Supprimer les paroles", "", "Paroles"),
+    ActionSpec("pochette", "Intégrer une pochette", "sources par ordre de priorité", "Pochette", [
+        OptSpec("sources", "Sources, par ordre de priorité", COVER_SOURCES, "dossier, en_ligne_1", multi=True),
+    ], can_fail=True),
+    ActionSpec("sans_pochette", "Supprimer les pochettes intégrées", "", "Pochette"),
+    ActionSpec("champs", "Fixer des champs", "ex. genre = Rock", "Tags", free_keys=True),
+    ActionSpec("supprimer_champs", "Supprimer des champs", "ex. commentaire, encodeur", "Tags", [
+        OptSpec("champs", "Champs à supprimer", None, "comment, encodeur"),
+    ]),
+    ActionSpec("numeroter", "Numéroter les pistes", "d'après les noms ou dans l'ordre", "Tags", [
+        OptSpec("mode", "Numéros", [("noms", "d'après le début du nom (« 01 - … »)"),
+                                    ("ordre", "dans l'ordre des fichiers")], "noms"),
+        OptSpec("total", "Total de pistes", [("oui", "l'écrire aussi"), ("non", "ne pas l'écrire")], "oui"),
+    ], album_only=True, can_fail=True),
+    ActionSpec("titres", "Titres d'après les noms de fichiers", "« 01 - Loser.flac » → Loser", "Tags"),
+    ActionSpec("remplacer", "Rechercher / remplacer", "ex. retirer « (2016 Remaster) »", "Tags", [
+        OptSpec("champ", "Dans le champ", [(f, LABEL[f]) for f in TEXT_FIELDS] + [("tous", "tous les champs texte")],
+                "title"),
+        OptSpec("chercher", "Rechercher", None, ""),
+        OptSpec("par", "Remplacer par", None, ""),
+        OptSpec("regex", "Expression régulière", [("non", "non, texte simple"), ("oui", "oui")], "non"),
+    ]),
+    ActionSpec("effacer_tags", "Effacer tous les tags", "tags et pochettes", "Tags"),
+    ActionSpec("renommer", "Renommer les fichiers", "d'après les tags", "Fichiers", [
+        OptSpec("modele", "Modèle", None, "{n} - {title}"),
+    ], can_fail=True),
+    ActionSpec("nettoyer", "Nettoyer le dossier", "supprimer tout sauf la musique", "Fichiers", [
+        OptSpec("types", "Types à supprimer", [("tout", "tout")] + CLEAN_TYPES, "tout", multi=True),
+    ], album_only=True),
+    ActionSpec("cue", "Découper l'image CD (.cue)", "pistes FLAC au sample près", "Fichiers", [
+        OptSpec("original", "Image d'origine", [("ranger", "la ranger dans « _source »"),
+                                                ("supprimer", "la supprimer"),
+                                                ("laisser", "la laisser en place")], "ranger"),
+    ], album_only=True, can_fail=True),
+]
+ACTION = {a.key: a for a in ACTIONS}
+SCRIPT_FIELDS = [f for f, _ in FIELDS]
+
+
+def _choice_label(o: OptSpec, value: str) -> str:
+    return dict(o.choices or []).get(value, value)
+
+
+@dataclass
+class Step:
+    action: str
+    opts: Dict[str, str] = dc_field(default_factory=dict)
+    on_fail: str = "continuer"
+
+    @property
+    def spec(self) -> ActionSpec:
+        return ACTION[self.action]
+
+    def opt(self, key: str) -> str:
+        if key in self.opts:
+            return self.opts[key]
+        return next((o.default for o in self.spec.opts if o.key == key), "")
+
+    def describe(self) -> str:
+        a = self.action
+        if a == "champs":
+            return " · ".join(f"{LABEL.get(f, f)} = {v or '(vide)'}" for f, v in self.opts.items())
+        if a == "pochette":
+            return " → ".join(_choice_label(self.spec.opts[0], s) for s in _split_list(self.opt("sources")))
+        if a == "remplacer":
+            where = _choice_label(self.spec.opts[0], self.opt("champ"))
+            by = f"« {self.opt('par')} »" if self.opt("par") else "(rien : supprimé)"
+            return (f"« {self.opt('chercher')} » → {by} dans {where.lower()}"
+                    + (" (expression régulière)" if self.opt("regex") == "oui" else ""))
+        if a == "nettoyer":
+            types = _split_list(self.opt("types"))
+            return "tout" if "tout" in types else ", ".join(CLEAN_TYPE_KIND.get(t, t) for t in types)
+        if a in ("renommer", "supprimer_champs"):
+            return self.opt(self.spec.opts[0].key)
+        return " · ".join(f"{o.label.lower()} : {_choice_label(o, self.opt(o.key))}" for o in self.spec.opts)
+
+
+@dataclass
+class Script:
+    name: str
+    steps: List[Step] = dc_field(default_factory=list)
+    verbose: bool = False
+    path: str = ""
+
+    def summary(self) -> str:
+        return " → ".join(st.spec.label for st in self.steps) or "(aucune étape)"
+
+
+def _split_list(v: str) -> List[str]:
+    return [x.strip() for x in (v or "").split(",") if x.strip()]
+
+
+def _unquote_value(v: str) -> str:
+    v = v.strip()
+    if len(v) >= 2 and v[0] == v[-1] == '"':
+        return v[1:-1]
+    return v
+
+
+def _quote_value(v: str) -> str:
+    return f'"{v}"' if v != v.strip() or not v or (v[0] == v[-1] == '"') else v
+
+
+def _check_option(o: OptSpec, v: str, where: str) -> str:
+    if o.choices is None:
+        return v
+    allowed = [c for c, _ in o.choices]
+    if not o.multi:
+        v = v.lower()
+        if v not in allowed:
+            raise ScriptError(f"{where} : « {v} » n'est pas possible pour {o.key} (possibles : {', '.join(allowed)})")
+        return v
+    vals = []
+    for x in _split_list(v.lower()):
+        if x not in allowed:
+            raise ScriptError(f"{where} : « {x} » n'est pas possible pour {o.key} (possibles : {', '.join(allowed)})")
+        if x not in vals:
+            vals.append(x)
+    if not vals:
+        raise ScriptError(f"{where} : {o.key} est vide")
+    if "tout" in vals:
+        vals = ["tout"]
+    return ", ".join(vals)
+
+
+def validate_step(st: Step, where: str = "") -> None:
+    where = where or f"étape « {st.spec.label} »"
+    if st.action == "champs" and not st.opts:
+        raise ScriptError(f"{where} : aucun champ à fixer")
+    if st.action == "supprimer_champs" and not _split_list(st.opt("champs")):
+        raise ScriptError(f"{where} : aucun champ à supprimer")
+    if st.action == "renommer" and not st.opt("modele").strip():
+        raise ScriptError(f"{where} : modèle vide")
+    if st.action == "remplacer":
+        if not st.opt("chercher"):
+            raise ScriptError(f"{where} : rien à rechercher")
+        if st.opt("regex") == "oui":
+            try:
+                re.compile(st.opt("chercher"))
+            except re.error as e:
+                raise ScriptError(f"{where} : expression régulière invalide ({e})")
+
+
+def parse_script(text: str, name: str = "", path: str = "") -> Script:
+    sc = Script(name, path=path)
+    cur: Optional[Step] = None
+    start = 0
+    for n, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip().lstrip("﻿")
+        if not line or line.startswith(("#", ";")):
+            continue
+        where = f"ligne {n}"
+        if line.startswith("[") and line.endswith("]"):
+            if cur is not None:
+                validate_step(cur, f"ligne {start}")
+            key = line[1:-1].strip().lower()
+            if key not in ACTION:
+                raise ScriptError(f"{where} : action inconnue « {key} » (possibles : {', '.join(ACTION)})")
+            cur, start = Step(key), n
+            sc.steps.append(cur)
+            continue
+        if "=" not in line:
+            raise ScriptError(f"{where} : « clé = valeur » attendu")
+        k, v = line.split("=", 1)
+        k, v = k.strip().lower(), _unquote_value(v)
+        if cur is None:
+            if k == "verbeux":
+                sc.verbose = _check_option(OptSpec("verbeux", "", YES_NO), v, where) == "oui"
+            elif k not in ("nom", "description"):
+                raise ScriptError(f"{where} : réglage inconnu « {k} » (avant la 1re étape : verbeux)")
+            continue
+        if k == "si_echec":
+            cur.on_fail = _check_option(OptSpec("si_echec", "", FAIL_CHOICES), v, where)
+            continue
+        if cur.spec.free_keys:
+            if k not in SCRIPT_FIELDS:
+                raise ScriptError(f"{where} : champ inconnu « {k} » (possibles : {', '.join(SCRIPT_FIELDS)})")
+            cur.opts[k] = v
+            continue
+        o = next((o for o in cur.spec.opts if o.key == k), None)
+        if o is None:
+            known = ", ".join([o.key for o in cur.spec.opts] + ["si_echec"])
+            raise ScriptError(f"{where} : option inconnue « {k} » pour [{cur.action}] (possibles : {known})")
+        cur.opts[k] = _check_option(o, v, where)
+    if cur is not None:
+        validate_step(cur, f"ligne {start}")
+    return sc
+
+
+def dump_script(sc: Script) -> str:
+    out = ["# Script musitag — se modifie dans musitag (touche s), ou ici à la main.",
+           f"# Lancement, depuis le dossier d'un album : musitag -s {sc.name}",
+           "", f"verbeux = {'oui' if sc.verbose else 'non'}"]
+    for i, st in enumerate(sc.steps, 1):
+        out += ["", f"# {i}. {st.spec.label}", f"[{st.action}]"]
+        if st.spec.free_keys:
+            out += [f"{k} = {_quote_value(v)}" for k, v in st.opts.items()]
+        else:
+            out += [f"{o.key} = {_quote_value(st.opt(o.key))}" for o in st.spec.opts]
+        if st.spec.can_fail:
+            out.append(f"si_echec = {st.on_fail}")
+    return "\n".join(out) + "\n"
+
+
+def clean_script_name(s: str) -> str:
+    s = os.path.basename(s.strip())
+    if s.lower().endswith(SCRIPT_EXT):
+        s = s[:-len(SCRIPT_EXT)]
+    s = re.sub(r"\s+", "-", s)
+    s = re.sub(r"[^\w.-]", "", s).strip(".-")
+    return s[:60]
+
+
+def list_scripts() -> List[str]:
+    try:
+        names = os.listdir(SCRIPTS_DIR)
+    except OSError:
+        return []
+    return sorted((n[:-len(SCRIPT_EXT)] for n in names if n.endswith(SCRIPT_EXT) and not n.startswith(".")),
+                  key=natural_key)
+
+
+def find_script(arg: str) -> str:
+    """Nom d'un script enregistré (avec ou sans .mst), ou chemin vers un fichier .mst."""
+    p = os.path.expanduser(arg)
+    if os.sep in arg or os.path.isfile(p):
+        if os.path.isfile(p):
+            return os.path.abspath(p)
+        raise ScriptError(f"Fichier introuvable : {p}")
+    name = clean_script_name(arg)
+    path = os.path.join(SCRIPTS_DIR, name + SCRIPT_EXT)
+    if os.path.isfile(path):
+        return path
+    known = list_scripts()
+    raise ScriptError(f"Script « {arg} » introuvable dans {SCRIPTS_DIR}."
+                      + (f"\nScripts disponibles : {', '.join(known)}" if known else
+                         "\nAucun script pour l'instant : crée-en un dans musitag (touche s)."))
+
+
+def load_script(path: str) -> Script:
+    try:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+    except (OSError, UnicodeDecodeError) as e:
+        raise ScriptError(f"Lecture impossible de {path} : {e}")
+    name = os.path.basename(path)
+    name = name[:-len(SCRIPT_EXT)] if name.endswith(SCRIPT_EXT) else name
+    try:
+        return parse_script(text, name, path)
+    except ScriptError as e:
+        raise ScriptError(f"{os.path.basename(path)}, {e}")
+
+
+def _give_back_to_user(paths: List[str]) -> None:
+    """Lancé via sudo : les fichiers de réglages restent à l'utilisateur."""
+    uid, gid = os.environ.get("SUDO_UID"), os.environ.get("SUDO_GID")
+    if os.geteuid() == 0 and uid and gid:
+        for path in paths:
+            try:
+                os.chown(path, int(uid), int(gid))
+            except OSError:
+                pass
+
+
+def save_script(sc: Script) -> str:
+    os.makedirs(SCRIPTS_DIR, exist_ok=True)
+    path = os.path.join(SCRIPTS_DIR, sc.name + SCRIPT_EXT)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(dump_script(sc))
+    os.replace(tmp, path)
+    sc.path = path
+    _give_back_to_user([os.path.dirname(SCRIPTS_DIR), SCRIPTS_DIR, path])
+    return path
+
+
+# ─── brouillons : ce que deviendra chaque morceau, sans rien écrire ───
+
+class Draft:
+    """État prévu d'un morceau. Mêmes méthodes de lecture qu'AudioFile (get, first, length…),
+    pour que les recherches existantes (LRCLIB, pochettes) fonctionnent dessus telles quelles."""
+
+    def __init__(self, af: Optional[AudioFile] = None, path: str = "",
+                 base: Optional[Dict[str, List[str]]] = None, length: float = 0.0, split=None):
+        self.af = af
+        self.path = af.path if af is not None else path
+        self.orig_stem = os.path.splitext(os.path.basename(self.path))[0]
+        self.base = base or {}               # tags d'une piste pas encore créée (découpage)
+        self._length = length
+        self.split = split                   # (SplitItem, CueSheet) si la piste naît d'un découpage
+        self.fields: Dict[str, List[str]] = {}
+        self.raw_del: List[str] = []
+        self.wipe = False
+        self.pic: Optional[Tuple[bytes, str, str]] = None      # (données, mime, description)
+        self.pic_clear = False
+        self.new_name: Optional[str] = None
+
+    def get(self, f: str) -> List[str]:
+        if f in self.fields:
+            return list(self.fields[f])
+        if self.wipe:
+            return []
+        if self.af is not None:
+            return self.af.get(f)
+        return list(self.base.get(f, []))
+
+    def first(self, f: str) -> str:
+        v = self.get(f)
+        return v[0] if v else ""
+
+    def length(self) -> float:
+        return self.af.length() if self.af is not None else self._length
+
+    @property
+    def name(self) -> str:
+        return self.new_name or os.path.basename(self.path)
+
+    @property
+    def stem(self) -> str:
+        return os.path.splitext(self.name)[0]
+
+    @property
+    def ext(self) -> str:
+        return os.path.splitext(self.path)[1]
+
+    @property
+    def dir(self) -> str:
+        return os.path.dirname(self.path)
+
+    def has_picture(self) -> bool:
+        if self.pic:
+            return True
+        if self.pic_clear or self.wipe:
+            return False
+        return bool(self.af is not None and self.af.backend.pictures())
+
+    def picture_data(self) -> Optional[bytes]:
+        if self.pic:
+            return self.pic[0]
+        if self.pic_clear or self.wipe or self.af is None:
+            return None
+        return first_picture(self.af)
+
+    def raw_items(self) -> List[Tuple[str, str]]:
+        if self.wipe or self.af is None:
+            return []
+        return [(k, v) for k, v in self.af.backend.raw_items() if k not in self.raw_del]
+
+    def set(self, f: str, values: List[str]) -> None:
+        self.fields[f] = normalize(f, values)
+
+    def set_picture(self, data: bytes, mime: str, desc: str) -> None:
+        self.pic, self.pic_clear = (data, mime, desc), False
+
+    def clear_pictures(self) -> None:
+        self.pic, self.pic_clear = None, True
+
+
+def draft_ops(d: Draft, af: Optional[AudioFile] = None) -> List[Op]:
+    """Les modifications qui font passer le fichier (réel, ou piste à créer) au brouillon."""
+    real = af if af is not None else d.af
+    target = real if real is not None else d
+
+    def current(f: str) -> List[str]:
+        return real.get(f) if real is not None else list(d.base.get(f, []))
+
+    ops: List[Op] = []
+    if d.wipe:
+        n = len(real.backend.raw_items()) if real is not None else len(d.base)
+        ops.append(Op(target, "wipe", before=f"{n} champ(s)", after="", label="Tous les tags"))
+    for f, vals in d.fields.items():
+        old = [] if d.wipe else current(f)
+        if old == vals:
+            continue
+        if f == "lyrics":
+            ops.append(Op(target, "set", f, vals, before=lyrics_summary("\n".join(old)),
+                          after=lyrics_summary("\n".join(vals)), label="Paroles"))
+        else:
+            ops.append(Op(target, "set", f, vals, before=join_values(old), after=join_values(vals),
+                          label=LABEL.get(f, f)))
+    if not d.wipe and real is not None and d.raw_del:
+        present = dict(real.backend.raw_items())
+        for k in d.raw_del:
+            if k in present:
+                ops.append(Op(target, "raw_delete", k, before=oneline(present[k], 120), after="", label=k))
+    npics = len(real.backend.pictures()) if real is not None else 0
+    if d.pic:
+        ops.append(Op(target, "pic_add", before=f"{npics} image(s)" if npics else "aucune",
+                      after=d.pic[2], label="Pochette", data=d.pic[0], mime=d.pic[1]))
+    elif d.pic_clear and npics and not d.wipe:
+        ops.append(Op(target, "pics_clear", before=f"{npics} image(s)", after="", label="Pochette"))
+    cur_name = os.path.basename(real.path if real is not None else d.path)
+    if d.new_name and d.new_name != cur_name:
+        ops.append(Op(target, "rename", before=cur_name, after=d.new_name, label="Nom"))
+    return ops
+
+
+@dataclass
+class AlbumPlan:
+    folder: str
+    drafts: List[Draft]
+    single: bool = False                                     # un seul morceau visé
+    splits: list = dc_field(default_factory=list)           # [(CueSheet, [SplitItem], [sources], mode)]
+    deletions: List[CleanItem] = dc_field(default_factory=list)
+    excluded: set = dc_field(default_factory=set)           # image CD et .cue pris en charge
+    report: List[Tuple[int, str, str, str]] = dc_field(default_factory=list)   # (n°, étape, statut, texte)
+    unreadable: List[Tuple[str, str]] = dc_field(default_factory=list)
+    cache: dict = dc_field(default_factory=dict)
+    counts: Optional[Dict[str, int]] = None
+    fixed_label: str = ""
+
+    def release(self) -> None:
+        """Album préparé : on garde le brouillon, mais on libère les tags et pochettes lus sur le
+        disque (sur toute une bibliothèque, ça finirait par remplir la mémoire). Rechargés à l'écriture."""
+        self.counts, self.fixed_label = album_counts(self), self.label
+        self.cache.clear()
+        for d in self.drafts:
+            if d.split is None:
+                d.af = None
+
+    def reload(self) -> List[Tuple[str, str]]:
+        errors = []
+        for d in self.drafts:
+            if d.af is None and d.split is None:
+                try:
+                    d.af = AudioFile(d.path)
+                except Exception as e:
+                    errors.append((os.path.basename(d.path), "illisible au moment d'écrire : " + friendly_error(e)))
+        return errors
+
+    @property
+    def label(self) -> str:
+        if self.fixed_label:
+            return self.fixed_label
+        artist = _most_common([d.first("albumartist") or d.first("artist") for d in self.drafts])
+        album = _most_common([d.first("album") for d in self.drafts])
+        if self.single and self.drafts:
+            return self.drafts[0].name
+        if artist and album:
+            return f"{artist} – {album}"
+        return os.path.basename(self.folder.rstrip(os.sep)) or self.folder
+
+
+# ─── pendant l'exécution : touches s / q / v ───
+
+class RunCtx:
+    def __init__(self, verbose: bool = False):
+        self.verbose = verbose
+        self.skip = threading.Event()
+        self.stop = threading.Event()
+        self.cache: dict = {}
+
+    @property
+    def stopping(self) -> bool:
+        return self.stop.is_set()
+
+    def check(self) -> None:
+        """Point d'arrêt : lève StepSkipped si s ou q a été pressé."""
+        if self.skip.is_set() or self.stop.is_set():
+            raise StepSkipped()
+
+    def log(self, msg: str) -> None:
+        if self.verbose:
+            console.print(Text("       · " + msg, style="dim"))
+
+
+class KeyListener:
+    """Lit les touches sans Entrée (mode cbreak) dans un fil à part, le temps d'un script.
+    Le terminal est toujours remis dans son état d'origine à la sortie."""
+
+    def __init__(self, ctx: RunCtx, writing: bool = False):
+        self.ctx, self.writing = ctx, writing
+        self.active = False
+        self._end = threading.Event()
+        self._thread = None
+        self._saved = None
+        self._fd = None
+        self._old_sigint = None
+
+    def __enter__(self):
+        try:
+            import termios
+            import tty
+            fd = sys.stdin.fileno()
+            if not os.isatty(fd):
+                return self
+            if self.writing:
+                import signal
+                self._old_sigint = signal.signal(signal.SIGINT, lambda *a: self.ctx.stop.set())
+            self._saved = termios.tcgetattr(fd)
+            tty.setcbreak(fd)
+            self._fd, self.active = fd, True
+            self._thread = threading.Thread(target=self._loop, daemon=True)
+            self._thread.start()
+        except Exception:
+            self.active = False
+        return self
+
+    def _loop(self) -> None:
+        import select
+        while not self._end.is_set():
+            try:
+                ready, _, _ = select.select([self._fd], [], [], 0.1)
+                if not ready:
+                    continue
+                ch = os.read(self._fd, 1).decode("latin-1").lower()
+            except (OSError, ValueError):
+                return
+            if ch == "q":
+                if not self.ctx.stop.is_set():
+                    console.print(Text("  ■ arrêt demandé : " + ("fin du fichier en cours, puis arrêt"
+                                                                  if self.writing else "on passe au bilan de ce qui est prêt"),
+                                       style="bold yellow"))
+                self.ctx.stop.set()
+            elif ch == "s" and not self.writing:
+                self.ctx.skip.set()
+            elif ch == "v":
+                self.ctx.verbose = not self.ctx.verbose
+                console.print(Text(f"  (verbeux : {'oui' if self.ctx.verbose else 'non'})", style="dim"))
+
+    def __exit__(self, *exc):
+        self._end.set()
+        if self._old_sigint is not None:
+            import signal
+            signal.signal(signal.SIGINT, self._old_sigint)
+        if self._thread is not None:
+            self._thread.join(timeout=1)
+        if self._saved is not None:
+            import termios
+            try:
+                termios.tcsetattr(self._fd, termios.TCSADRAIN, self._saved)
+                termios.tcflush(self._fd, termios.TCIFLUSH)      # touches tapées en route : oubliées
+            except Exception:
+                pass
+        return False
+
+
+def _await(ctx: RunCtx, fn, *args):
+    """Lance fn dans un fil à part et attend, en rendant la main dès que s ou q est pressé
+    (le fil abandonné finit seul en arrière-plan ; son résultat est ignoré)."""
+    box_: dict = {}
+    done = threading.Event()
+
+    def run():
+        try:
+            box_["res"] = fn(*args)
+        except BaseException as e:      # noqa: B902 — renvoyé tel quel au fil principal
+            box_["err"] = e
+        finally:
+            done.set()
+
+    threading.Thread(target=run, daemon=True).start()
+    while not done.wait(0.1):
+        ctx.check()
+    if "err" in box_:
+        raise box_["err"]
+    return box_.get("res")
+
+
+def _await_many(ctx: RunCtx, fn, items: list, workers: int, on_done) -> None:
+    """fn(item) en parallèle ; on_done(i, résultat) dans le fil principal au fur et à mesure."""
+    import queue
+    todo: "queue.Queue[int]" = queue.Queue()
+    for i in range(len(items)):
+        todo.put(i)
+    results: "queue.Queue[Tuple[int, object]]" = queue.Queue()
+    abandon = threading.Event()
+
+    def worker():
+        while not abandon.is_set():
+            try:
+                i = todo.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                r = fn(items[i])
+            except Exception as e:
+                r = e
+            results.put((i, r))
+
+    for _ in range(max(1, min(workers, len(items)))):
+        threading.Thread(target=worker, daemon=True).start()
+    got = 0
+    try:
+        while got < len(items):
+            try:
+                i, r = results.get(timeout=0.1)
+            except queue.Empty:
+                ctx.check()
+                continue
+            got += 1
+            on_done(i, r)
+            ctx.check()
+    finally:
+        abandon.set()
+
+
+# ─── les étapes : chacune prépare, aucune n'écrit ───
+
+def _set_album_picture(al: AlbumPlan, data: bytes, mime: str, desc: str) -> None:
+    for d in al.drafts:
+        d.set_picture(data, mime, desc)
+
+
+def _download_cover(c: CoverCandidate) -> Optional[bytes]:
+    for u in c.urls:
+        try:
+            data = http_get(u, CAA_THROTTLE, accept="image/*")
+        except NetError:
+            data = None
+        if data and image_mime(data):
+            return data
+    return None
+
+
+def plan_paroles(ctx: RunCtx, al: AlbumPlan, st: Step) -> str:
+    keep = st.opt("existantes") == "garder"
+    approx_ok = st.opt("accepter") == "premieres"
+    instr_ok = st.opt("instrumental") == "oui"
+    todo = [d for d in al.drafts if not (keep and get_lyrics(d))]
+    if not todo:
+        return "rien à chercher : tous les morceaux ont déjà des paroles"
+    if "lrclib_down" not in ctx.cache:
+        ctx.cache["lrclib_down"] = _await(ctx, lrclib_ping)
+    if ctx.cache["lrclib_down"]:
+        raise StepFailed(f"LRCLIB injoignable ({ctx.cache['lrclib_down']})")
+    c = dict(exact=0, approx=0, instrumental=0, ignored=0, notfound=0, error=0)
+    streak = [0]
+
+    def done(i: int, r) -> None:
+        d = todo[i]
+        if not isinstance(r, LyricsResult):
+            r = LyricsResult(d, "error", message=str(r) or type(r).__name__)
+        text, why = None, ""
+        if r.status == "exact":
+            text, why = r.match.text, "exacte" + (" (synchronisée)" if r.match.kind == "synced" else " (texte)")
+        elif r.status == "approx":
+            if approx_ok:
+                text, why = r.match.text, f"approchante, prise : {r.match.describe()}"
+            else:
+                c["ignored"] += 1
+                why = f"approchante, ignorée : {r.match.describe()}"
+        elif r.status == "instrumental":
+            if instr_ok and (r.match is None or r.match.exact or approx_ok):
+                text, why = INSTRUMENTAL_TEXT, "instrumental"
+            else:
+                c["ignored"] += 1
+                why = "instrumental (rien écrit)"
+        elif r.status == "error":
+            c["error"] += 1
+            why = "erreur : " + r.message
+        else:
+            c["notfound"] += 1
+            why = r.message or "introuvable"
+        if text:
+            c["instrumental" if text == INSTRUMENTAL_TEXT else r.status] += 1
+            d.set("lyrics", [text.strip()])
+        ctx.log(f"{d.name} : {why}")
+        streak[0] = streak[0] + 1 if r.status == "error" else 0
+        if streak[0] >= 8:
+            raise StepFailed("LRCLIB ne répond plus (8 erreurs de suite)")
+
+    _await_many(ctx, lrclib_lookup, todo, LRCLIB_WORKERS, done)
+    found = c["exact"] + c["approx"] + c["instrumental"]
+    parts = [f"{n} {lab}" for n, lab in ((c["exact"], "exacte(s)"), (c["approx"], "approchante(s)"),
+                                          (c["instrumental"], "instrumental(aux)"), (c["ignored"], "ignorée(s)"),
+                                          (c["notfound"], "introuvable(s)"), (c["error"], "en erreur")) if n]
+    summary = ", ".join(parts)
+    if not found:
+        raise StepFailed("aucune parole retenue" + (f" ({summary})" if summary else ""))
+    return f"{found} morceau(x) : " + summary
+
+
+def plan_instrumental(ctx: RunCtx, al: AlbumPlan, st: Step) -> str:
+    keep = st.opt("existantes") == "garder"
+    n = 0
+    for d in al.drafts:
+        if keep and get_lyrics(d):
+            continue
+        if get_lyrics(d) != INSTRUMENTAL_TEXT:
+            ctx.log(f"{d.name} : marqué instrumental")
+            d.set("lyrics", [INSTRUMENTAL_TEXT])
+            n += 1
+    return f"{n} morceau(x) marqué(s)" if n else "rien à faire"
+
+
+def plan_sans_paroles(ctx: RunCtx, al: AlbumPlan, st: Step) -> str:
+    n = 0
+    for d in al.drafts:
+        if get_lyrics(d):
+            ctx.log(f"{d.name} : paroles retirées")
+            d.set("lyrics", [])
+            n += 1
+    return f"paroles retirées de {n} morceau(x)" if n else "aucune parole à retirer"
+
+
+def plan_pochette(ctx: RunCtx, al: AlbumPlan, st: Step) -> str:
+    tried: List[str] = []
+    for src in _split_list(st.opt("sources")):
+        ctx.check()
+        if src == "garder":
+            data = next((p for p in (d.picture_data() for d in al.drafts) if p), None)
+            mime = image_mime(data) if data else None
+            if data:
+                missing = [d for d in al.drafts if not d.has_picture()]
+                if missing and mime:
+                    for d in missing:
+                        d.set_picture(data, mime, f"pochette de l'album · {human_size(len(data))}")
+                    return f"pochette déjà intégrée, gardée et copiée dans {len(missing)} morceau(x)"
+                return "pochette déjà intégrée, gardée"
+            tried.append("aucune pochette intégrée")
+            ctx.log("pas de pochette intégrée")
+        elif src == "dossier":
+            cover = find_cover(al.folder)
+            if not cover:
+                tried.append("pas d'image dans le dossier")
+                ctx.log("pas d'image dans le dossier")
+                continue
+            try:
+                data, mime = read_image(cover)
+            except (OSError, TagError) as e:
+                tried.append(f"{os.path.basename(cover)} illisible ({e})")
+                continue
+            dims = image_dims(data)
+            _set_album_picture(al, data, mime, " · ".join(x for x in (os.path.basename(cover), dims,
+                                                                      human_size(len(data))) if x))
+            return f"image du dossier : {os.path.basename(cover)}" + (f" ({dims})" if dims else "")
+        else:
+            n = int(src.rsplit("_", 1)[1])
+            cands = al.cache.get("covers")
+            if cands is None:
+                artist = _most_common([d.first("albumartist") or d.first("artist") for d in al.drafts])
+                album = _most_common([d.first("album") for d in al.drafts])
+                cands = []
+                if not artist or not album:
+                    tried.append("artiste ou album absent des tags : pas de recherche en ligne")
+                else:
+                    ctx.log(f"recherche MusicBrainz / Cover Art Archive : {artist} – {album}")
+                    try:
+                        cands = _await(ctx, cover_candidates, artist, album) or []
+                    except NetError as e:
+                        tried.append(f"MusicBrainz injoignable ({e})")
+                    ctx.log(f"{len(cands)} pochette(s) proposée(s)")
+                al.cache["covers"] = cands
+            if len(cands) < n:
+                if cands or not tried:
+                    tried.append(f"pas de {n}{'er' if n == 1 else 'e'} résultat en ligne")
+                continue
+            cand = cands[n - 1]
+            label = " ".join(x for x in (cand.album, cand.date[:4], cand.country) if x)
+            ctx.log(f"téléchargement : {label}")
+            data = _await(ctx, _download_cover, cand)
+            if not data:
+                tried.append(f"téléchargement impossible ({label})")
+                continue
+            dims = image_dims(data)
+            _set_album_picture(al, data, image_mime(data),
+                               " · ".join(x for x in ("Cover Art Archive", label, dims) if x))
+            return f"en ligne, {n}{'er' if n == 1 else 'e'} résultat : {label}" + (f" ({dims})" if dims else "")
+    raise StepFailed("aucune pochette" + (" : " + " ; ".join(dict.fromkeys(tried)) if tried else ""))
+
+
+def plan_sans_pochette(ctx: RunCtx, al: AlbumPlan, st: Step) -> str:
+    n = 0
+    for d in al.drafts:
+        if d.has_picture():
+            ctx.log(f"{d.name} : pochette retirée")
+            d.clear_pictures()
+            n += 1
+    return f"pochettes retirées de {n} morceau(x)" if n else "aucune pochette à retirer"
+
+
+def plan_champs(ctx: RunCtx, al: AlbumPlan, st: Step) -> str:
+    changed = 0
+    for d in al.drafts:
+        touched = False
+        for f, v in st.opts.items():
+            vals = [] if not v else (split_values(v) if f not in NUM_FIELDS else [v])
+            if d.get(f) != normalize(f, vals):
+                ctx.log(f"{d.name} : {LABEL[f]} « {join_values(d.get(f))} » → « {join_values(normalize(f, vals))} »")
+                d.set(f, vals)
+                touched = True
+        changed += touched
+    return f"{changed} morceau(x) modifié(s)" if changed else "déjà comme demandé"
+
+
+def plan_supprimer_champs(ctx: RunCtx, al: AlbumPlan, st: Step) -> str:
+    names = _split_list(st.opt("champs"))
+    changed = 0
+    for d in al.drafts:
+        touched = False
+        for name in names:
+            low = name.lower()
+            if low in LABEL and low != "lyrics":
+                if d.get(low):
+                    ctx.log(f"{d.name} : {LABEL[low]} supprimé")
+                    d.set(low, [])
+                    touched = True
+                continue
+            targets = {t.lower() for t in FIELD_ALIASES.get(low, (name,))}
+            for key, _ in d.raw_items():
+                if key.lower() in targets or key.split(":")[0].lower() in targets:
+                    ctx.log(f"{d.name} : {key} supprimé")
+                    d.raw_del.append(key)
+                    touched = True
+        changed += touched
+    return f"{changed} morceau(x) concerné(s)" if changed else "aucun de ces champs n'est présent"
+
+
+def plan_numeroter(ctx: RunCtx, al: AlbumPlan, st: Step) -> str:
+    drafts = sorted(al.drafts, key=lambda d: path_sort_key(os.path.join(d.dir, d.name)))
+    if st.opt("mode") == "noms":
+        parsed = [(d, parse_track_from_name(d.stem)) for d in drafts]
+        ok = [(d, p) for d, p in parsed if p is not None]
+        if not ok:
+            raise StepFailed("aucun numéro trouvé au début des noms de fichiers")
+        if any(p[1] for _, p in ok):                    # faces de vinyle A1, B2… → séquentiel
+            ok.sort(key=lambda x: (x[1][1], x[1][2]))
+            assigned = [(d, i, p[0]) for i, (d, p) in enumerate(ok, 1)]
+        else:
+            assigned = [(d, p[2], p[0]) for d, p in ok]
+        missing = len(parsed) - len(ok)
+    else:
+        assigned = [(d, i, None) for i, d in enumerate(drafts, 1)]
+        missing = 0
+    total = max((n for _, n, _ in assigned), default=0)
+    for d, n, disc in assigned:
+        ctx.log(f"{d.name} : piste {n}" + (f", disque {disc}" if disc else ""))
+        d.set("tracknumber", [str(n)])
+        if st.opt("total") == "oui":
+            d.set("tracktotal", [str(total)])
+        if disc:
+            d.set("discnumber", [str(disc)])
+    return f"{len(assigned)} piste(s) numérotée(s)" + (f", {missing} sans numéro dans le nom" if missing else "")
+
+
+def plan_titres(ctx: RunCtx, al: AlbumPlan, st: Step) -> str:
+    n = 0
+    for d in al.drafts:
+        new = title_from_filename(d.stem, d.get("artist") + d.get("albumartist"))
+        if new and d.get("title") != [new]:
+            ctx.log(f"{d.name} : titre « {d.first('title')} » → « {new} »")
+            d.set("title", [new])
+            n += 1
+    return f"{n} titre(s)" if n else "titres déjà conformes aux noms"
+
+
+def plan_remplacer(ctx: RunCtx, al: AlbumPlan, st: Step) -> str:
+    fields = TEXT_FIELDS if st.opt("champ") == "tous" else [st.opt("champ")]
+    regex = st.opt("regex") == "oui"
+    pat = re.compile(st.opt("chercher") if regex else re.escape(st.opt("chercher")))
+    repl = st.opt("par")
+    n = 0
+    for d in al.drafts:
+        touched = False
+        for f in fields:
+            old = d.get(f)
+            if not old:
+                continue
+            new = [re.sub(r"\s{2,}", " ", pat.sub(repl if regex else (lambda m: repl), v)).strip() for v in old]
+            new = [v for v in new if v]
+            if new != old:
+                ctx.log(f"{d.name} : {LABEL[f]} « {join_values(old)} » → « {join_values(new)} »")
+                d.set(f, new)
+                touched = True
+        n += touched
+    return f"{n} morceau(x) modifié(s)" if n else "texte introuvable, rien à remplacer"
+
+
+def plan_effacer_tags(ctx: RunCtx, al: AlbumPlan, st: Step) -> str:
+    for d in al.drafts:
+        d.wipe, d.fields, d.raw_del, d.pic, d.pic_clear = True, {}, [], None, True
+    return f"tous les tags de {len(al.drafts)} morceau(x)"
+
+
+def plan_renommer(ctx: RunCtx, al: AlbumPlan, st: Step) -> str:
+    tpl = st.opt("modele")
+    taken = {os.path.join(d.dir, d.name) for d in al.drafts}
+    planned: Dict[str, str] = {}
+    problems: List[str] = []
+    n = 0
+    for d in al.drafts:
+        tr, tot = d.first("tracknumber"), d.first("tracktotal")
+        width = 3 if tot.isdigit() and int(tot) >= 100 else 2
+        vals = {"n": tr.zfill(width) if tr.isdigit() else tr, "title": d.first("title"),
+                "artist": d.first("artist"), "album": d.first("album"), "year": d.first("date")[:4],
+                "disc": d.first("discnumber"), "albumartist": d.first("albumartist") or d.first("artist")}
+        missing = [m for m in re.findall(r"\{(\w+)\}", tpl) if not vals.get(m)]
+        if missing:
+            problems.append(f"{d.name} (il manque : {', '.join(missing)})")
+            continue
+        name = tpl
+        for key, v in vals.items():
+            name = name.replace("{" + key + "}", v.replace("/", "-"))
+        name = safe_name(name) + d.ext.lower()
+        dest = os.path.join(d.dir, name)
+        if name == d.name:
+            continue
+        if dest in planned or (os.path.exists(dest) and dest not in taken):
+            problems.append(f"{d.name} (« {name} » existe déjà)")
+            continue
+        planned[dest] = d.name
+        ctx.log(f"{d.name} → {name}")
+        d.new_name = name
+        n += 1
+    for p in problems:
+        ctx.log("pas renommé : " + p)
+    if problems and not n:
+        raise StepFailed(f"aucun fichier renommé : {problems[0]}" + (f" (+{len(problems) - 1})" if len(problems) > 1 else ""))
+    return (f"{n} fichier(s) à renommer" if n else "noms déjà conformes") + \
+        (f", {len(problems)} ignoré(s)" if problems else "")
+
+
+def plan_nettoyer(ctx: RunCtx, al: AlbumPlan, st: Step) -> str:
+    types = _split_list(st.opt("types"))
+    kinds = None if "tout" in types else {CLEAN_TYPE_KIND[t] for t in types}
+    already = {it.path for it in al.deletions}
+    chosen = [it for it in scan_clean(al.folder, False)
+              if not it.protected and it.path not in al.excluded and it.path not in already
+              and (kinds is None or it.kind in kinds)]
+    pics = lyr = 0
+    for it in chosen:               # sauvetage : pochette et .lrc qui n'existent que dans ces fichiers
+        cover = it.path if (it.kind == "Image" and it.note == "pochette du dossier") else \
+            (find_cover(it.path) if it.is_dir else None)
+        if cover and any(not d.has_picture() for d in al.drafts):
+            try:
+                data, mime = read_image(cover)
+            except (OSError, TagError):
+                data = None
+            if data:
+                for d in al.drafts:
+                    if not d.has_picture():
+                        d.set_picture(data, mime, f"{os.path.relpath(cover, al.folder)} · {human_size(len(data))}")
+                        pics += 1
+        if it.kind == "Paroles .lrc":
+            stem = os.path.splitext(os.path.basename(it.path))[0].lower()
+            for d in al.drafts:
+                if stem in (d.orig_stem.lower(), d.stem.lower()) and not get_lyrics(d):
+                    try:
+                        text = _read_text(it.path).strip()
+                    except OSError:
+                        text = ""
+                    if text:
+                        d.set("lyrics", [text])
+                        lyr += 1
+        ctx.log(f"à supprimer : {os.path.relpath(it.path, al.folder)}{os.sep if it.is_dir else ''}")
+    al.deletions += chosen
+    if not chosen:
+        return "rien à supprimer"
+    msg = f"{len(chosen)} élément(s) à supprimer ({human_size(sum(it.size for it in chosen))})"
+    saved = ([f"pochette intégrée dans {pics} morceau(x)"] if pics else []) + \
+        ([f"paroles .lrc intégrées dans {lyr} morceau(x)"] if lyr else [])
+    return msg + (" ; avant : " + ", ".join(saved) if saved else "")
+
+
+def plan_cue(ctx: RunCtx, al: AlbumPlan, st: Step) -> str:
+    if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+        raise StepFailed("ffmpeg absent (" + install_cmd("ffmpeg-free", "ffmpeg") + ")")
+    cues = [c for c in find_files(al.folder, False, {".cue"}) if c not in al.excluded]
+    if not cues:
+        raise StepFailed("aucun fichier .cue dans ce dossier")
+    created = 0
+    for path in cues:
+        ctx.check()
+        try:
+            cs = parse_cue(path)
+        except Exception as e:
+            raise StepFailed(f"{os.path.basename(path)} illisible ({e})")
+        if not cs.tracks:
+            raise StepFailed(f"{os.path.basename(path)} ne contient aucune piste")
+        guess_disc(cs, cues)
+        sources: Dict[str, str] = {}
+        for fname in dict.fromkeys(t.file for t in cs.tracks):
+            src = resolve_source(cs, fname)
+            if src is None:
+                raise StepFailed(f"« {fname} », cité par {os.path.basename(path)}, est introuvable")
+            sources[fname] = src
+        try:
+            probes = {f: probe(p) for f, p in sources.items()}
+        except TagError as e:
+            raise StepFailed(str(e))
+        items = build_plan(cs, sources, probes)
+        clash = [it.out_path for it in items if os.path.exists(it.out_path)]
+        if clash:
+            raise StepFailed(f"« {os.path.basename(clash[0])} » existe déjà : album déjà découpé ?")
+        srcs = list(dict.fromkeys(sources.values()))
+        al.excluded.update(srcs + [path])
+        al.drafts = [d for d in al.drafts if d.path not in srcs]
+        for it in items:
+            length = it.expected / it.sr if it.expected else 0.0
+            al.drafts.append(Draft(path=it.out_path, base=track_tags(cs, it.track), length=length, split=(it, cs)))
+            ctx.log(f"piste à créer : {os.path.basename(it.out_path)}")
+        al.splits.append((cs, items, srcs, st.opt("original")))
+        created += len(items)
+    al.drafts.sort(key=lambda d: path_sort_key(d.path))
+    fate = {"ranger": "image d'origine rangée dans « _source »", "supprimer": "image d'origine supprimée",
+            "laisser": "image d'origine laissée en place"}[st.opt("original")]
+    return f"{created} piste(s) à créer, {fate}"
+
+
+PLANNERS = {
+    "paroles": plan_paroles, "instrumental": plan_instrumental, "sans_paroles": plan_sans_paroles,
+    "pochette": plan_pochette, "sans_pochette": plan_sans_pochette, "champs": plan_champs,
+    "supprimer_champs": plan_supprimer_champs, "numeroter": plan_numeroter, "titres": plan_titres,
+    "remplacer": plan_remplacer, "effacer_tags": plan_effacer_tags, "renommer": plan_renommer,
+    "nettoyer": plan_nettoyer, "cue": plan_cue,
+}
+
+STATUS_MARK = {"ok": ("✓", "green"), "skip": ("↷", "yellow"), "fail": ("✗", "red"),
+               "na": ("·", "dim"), "stop": ("■", "yellow")}
+
+
+def _report(al: AlbumPlan, n: int, label: str, status: str, text: str, show: bool = True) -> None:
+    al.report.append((n, label, status, text))
+    if show:
+        mark, style = STATUS_MARK[status]
+        console.print(Text.assemble(f"    {mark} ", (f"{n}. {label}", style if status != "ok" else "bold"),
+                                    (" : " + text if text else "", style if status != "ok" else "")))
+
+
+class _Quiet:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def _spinner(msg: str):
+    return console.status(msg, spinner="dots") if console.is_terminal else _Quiet()
+
+
+def plan_album(ctx: RunCtx, sc: Script, al: AlbumPlan) -> None:
+    keys = "  [dim](s : sauter · q : arrêter · v : verbeux)[/]" if sys.stdin.isatty() else ""
+    for j, st in enumerate(sc.steps, 1):
+        label = st.spec.label
+        if ctx.stopping:
+            _report(al, j, label, "stop", "pas faite (arrêt demandé)", show=False)
+            continue
+        if st.spec.album_only and al.single:
+            _report(al, j, label, "na", "ne s'applique pas à un morceau seul")
+            continue
+        if not al.drafts and st.action not in ("nettoyer", "cue"):
+            _report(al, j, label, "na", "aucun morceau")
+            continue
+        ctx.skip.clear()
+        failed = None
+        try:
+            with _spinner(f"[magenta]{j}. {escape(label)}…[/]{keys}"):
+                msg = PLANNERS[st.action](ctx, al, st)
+            _report(al, j, label, "ok", msg)
+        except StepSkipped:
+            if ctx.stopping:
+                _report(al, j, label, "stop", "interrompue (arrêt demandé) ; ce qui était prêt est gardé")
+            else:
+                _report(al, j, label, "skip", "sautée (touche s) ; ce qui était déjà prêt est gardé")
+        except KeyboardInterrupt:
+            ctx.stop.set()
+            _report(al, j, label, "stop", "interrompue (Ctrl+C) ; ce qui était prêt est gardé")
+        except StepFailed as e:
+            failed = str(e)
+        except Exception as e:                      # imprévu : traité comme un échec de l'étape
+            failed = friendly_error(e)
+        if failed is not None:
+            _report(al, j, label, "fail", failed)
+            if st.on_fail == "arreter":
+                console.print(Text("      → arrêt du script pour cet album (étape réglée sur « arrêter »)",
+                                   style="red"))
+                for k, rest in enumerate(sc.steps[j:], j + 1):
+                    _report(al, k, rest.spec.label, "na", "pas faite (arrêt après l'échec)", show=False)
+                return
+
+
+# ─── bilan, confirmation, écriture ───
+
+def album_counts(al: AlbumPlan) -> Dict[str, int]:
+    if al.counts is not None:
+        return al.counts
+    c = dict(tags=0, paroles=0, pochette=0, noms=0, crees=0, suppr=len(al.deletions))
+    for d in al.drafts:
+        ops = draft_ops(d)
+        if any(o.kind in ("set", "raw_delete", "wipe") and o.key != "lyrics" for o in ops):
+            c["tags"] += 1
+        if any(o.kind == "set" and o.key == "lyrics" for o in ops):
+            c["paroles"] += 1
+        if any(o.kind in ("pic_add", "pics_clear") for o in ops):
+            c["pochette"] += 1
+        if any(o.kind == "rename" for o in ops):
+            c["noms"] += 1
+    c["crees"] = sum(len(items) for _, items, _, _ in al.splits)
+    c["fichiers"] = sum(1 for d in al.drafts if draft_ops(d))
+    return c
+
+
+def _changes(c: Dict[str, int]) -> bool:
+    return bool(c["fichiers"] or c["crees"] or c["suppr"])
+
+
+def _steps_marks(al: AlbumPlan) -> Text:
+    t = Text()
+    for n, _, status, _ in al.report:
+        mark, style = STATUS_MARK[status]
+        t.append(f"{n}{mark} ", style=style)
+    return t
+
+
+def album_detail(al: AlbumPlan, limit: int = 60) -> list:
+    out: list = []
+    released = al.counts is not None
+    for name, err in al.reload():
+        out.append(Text(f"  ! {name} : {err}", style="yellow"))
+    ops = [o for d in al.drafts for o in draft_ops(d)]
+    if released:
+        for d in al.drafts:
+            if d.split is None:
+                d.af = None
+    if ops:
+        out.append(ops_table(ops, limit))
+        if len(ops) > limit:
+            out.append(Text(f"… et {len(ops) - limit} autres modifications", style="dim"))
+    for cs, items, srcs, mode in al.splits:
+        names = ", ".join(os.path.basename(it.out_path) for it in items[:6]) + (" …" if len(items) > 6 else "")
+        fate = {"ranger": "rangée dans « _source »", "supprimer": "supprimée", "laisser": "laissée en place"}[mode]
+        out.append(Text.assemble(("  Découpage ", "bold"), f"{os.path.basename(cs.path)} → {len(items)} pistes : ",
+                                 (names, "dim"), f"\n  Image d'origine {fate}."))
+    if al.deletions:
+        t = Text("  À supprimer : ", style="bold red")
+        for it in al.deletions[:20]:
+            t.append(f"\n    ✗ {os.path.relpath(it.path, al.folder)}{os.sep if it.is_dir else ''}", style="red")
+        if len(al.deletions) > 20:
+            t.append(f"\n    … et {len(al.deletions) - 20} autre(s)", style="dim")
+        out.append(t)
+    return out
+
+
+def show_bilan(albums: List[AlbumPlan], not_started: int) -> Dict[str, int]:
+    tot = dict(fichiers=0, crees=0, suppr=0, albums=0)
+    counts = [album_counts(al) for al in albums]
+    for c in counts:
+        tot["fichiers"] += c["fichiers"]
+        tot["crees"] += c["crees"]
+        tot["suppr"] += c["suppr"]
+        tot["albums"] += _changes(c)
+    console.print()
+    console.print(Rule(Text(" Bilan ", style="bold magenta"), style="magenta"))
+    if len(albums) == 1:
+        for r in album_detail(albums[0]):
+            console.print(r)
+    else:
+        t = Table(box=box.SIMPLE_HEAD, header_style="bold magenta", expand=True, pad_edge=False)
+        t.add_column("#", style="dim", justify="right", no_wrap=True)
+        t.add_column("Album", ratio=3, overflow="ellipsis", no_wrap=True)
+        t.add_column("Étapes", no_wrap=True)
+        for col in ("Tags", "Paroles", "Pochette", "Noms", "Pistes", "Suppr."):
+            t.add_column(col, justify="right", no_wrap=True)
+        shown = 0
+        for i, (al, c) in enumerate(zip(albums, counts), 1):
+            if shown >= 40:
+                break
+            shown += 1
+            cell = lambda v: Text(str(v), style="bold") if v else Text("·", style="dim")  # noqa: E731
+            t.add_row(str(i), Text(al.label), _steps_marks(al), cell(c["tags"]), cell(c["paroles"]),
+                      cell(c["pochette"]), cell(c["noms"]), cell(c["crees"]), cell(c["suppr"]))
+        console.print(t)
+        if len(albums) > shown:
+            console.print(f"[dim]… et {len(albums) - shown} autres albums (le détail complet est dans « Voir le détail »)[/]")
+        console.print("[dim]Étapes : ✓ faite · ↷ sautée · ✗ échec · · sans objet · ■ arrêtée[/]")
+    if not_started:
+        console.print(f"[yellow]{not_started} album(s) non préparé(s) (arrêt demandé) : ils ne seront pas touchés.[/]")
+    parts = [f"{tot['fichiers']} fichier(s) modifié(s)"]
+    if tot["crees"]:
+        parts.append(f"{tot['crees']} piste(s) créée(s)")
+    if tot["suppr"]:
+        parts.append(f"{tot['suppr']} élément(s) supprimé(s)")
+    console.print(Text.assemble(("  " + " · ".join(parts), "bold"),
+                                (f"  dans {tot['albums']} album(s)" if len(albums) > 1 else "", "")))
+    return tot
+
+
+def show_detail(albums: List[AlbumPlan]) -> None:
+    rends: list = []
+    for i, al in enumerate(albums, 1):
+        if not _changes(album_counts(al)):
+            continue
+        rends.append(Rule(Text(f" {i}. {al.label} ", style="bold"), style="magenta", align="left"))
+        rends.append(Text(al.folder, style="dim"))
+        for n, label, status, text in al.report:
+            mark, style = STATUS_MARK[status]
+            rends.append(Text(f"  {mark} {n}. {label} : {text}", style=style if status != "ok" else ""))
+        rends += album_detail(al, limit=100000)
+    print_long(rends)
+
+
+def apply_album(ctx: RunCtx, al: AlbumPlan):
+    """Écrit un album préparé. Renvoie (fichiers écrits, pistes créées, éléments supprimés, erreurs, notes)."""
+    written = created = deleted = 0
+    notes: List[str] = []
+    errors: List[Tuple[str, str]] = al.reload()
+    for cs, items, srcs, mode in al.splits:
+        complete = True
+        for it in items:
+            if ctx.stopping:
+                complete = False
+                break
+            d = next((d for d in al.drafts if d.split and d.split[0] is it), None)
+            err = split_one(it, cs)
+            if err:
+                errors.append((os.path.basename(it.out_path), err))
+                complete = False
+                continue
+            created += 1
+            if d is None:
+                continue
+            try:
+                d.af = AudioFile(it.out_path)
+            except Exception as e:
+                errors.append((os.path.basename(it.out_path), friendly_error(e)))
+        if complete:
+            err = move_originals(cs, srcs, mode)
+            if err:
+                errors.append((os.path.basename(cs.path), err))
+        else:
+            notes.append(f"image d'origine laissée en place ({os.path.basename(cs.path)})")
+    for k, d in enumerate(al.drafts):
+        if ctx.stopping:
+            left = sum(1 for x in al.drafts[k:] if x.af is not None and draft_ops(x, x.af))
+            if left:
+                notes.append(f"arrêt demandé : {left} fichier(s) pas écrit(s)")
+            break
+        if d.af is None:
+            continue
+        ops = draft_ops(d, d.af)
+        if not ops:
+            continue
+        try:
+            _apply_file(d.af, ops)
+            written += 1
+        except Exception as e:
+            errors.append((d.af.name, friendly_error(e)))
+        finally:
+            try:
+                d.af.load()
+            except Exception:
+                pass
+    if al.deletions:
+        if ctx.stopping:
+            notes.append("suppressions pas faites (arrêt demandé)")
+        elif errors:
+            notes.append("suppressions annulées : des écritures ont échoué dans cet album")
+        else:
+            ok, errs = delete_items(al.deletions, progress=False)
+            deleted += ok
+            errors += errs
+    return written, created, deleted, errors, notes
+
+
+def _covers_library(root: str) -> bool:
+    try:
+        r, lib = os.path.realpath(root), os.path.realpath(MUSIC_ROOT)
+    except OSError:
+        return False
+    return r == lib or lib.startswith(r.rstrip(os.sep) + os.sep)
+
+
+def _writable(targets) -> bool:
+    if os.geteuid() == 0:
+        return True
+    for folder, paths, _ in targets:
+        if not os.access(folder, os.W_OK) or not all(os.access(p, os.W_OK) for p in paths[:20]):
+            return False
+    return True
+
+
+def collect_targets(path: str, recursive: bool) -> List[Tuple[str, List[str], bool]]:
+    """(dossier, morceaux, morceau seul ?) pour chaque album visé."""
+    if os.path.isfile(path):
+        if os.path.splitext(path)[1].lower() not in AUDIO_EXTS:
+            raise ScriptError(f"« {os.path.basename(path)} » n'est pas un fichier audio pris en charge.")
+        return [(os.path.dirname(path), [path], True)]
+    files = find_files(path, recursive, AUDIO_EXTS)
+    groups: Dict[str, List[str]] = {}
+    for p in files:
+        groups.setdefault(os.path.dirname(p), []).append(p)
+    return [(d, fl, False) for d, fl in groups.items()]
+
+
+def run_script(sc: Script, targets, verbose: bool = False, simulation: bool = False, root: str = "") -> int:
+    """Prépare toutes les étapes sur tous les albums, montre le bilan, demande UNE confirmation,
+    puis écrit. Renvoie le code de sortie (0 = normal)."""
+    if not sc.steps:
+        info(f"Le script « {escape(sc.name)} » ne contient aucune étape.", "red")
+        return 1
+    root = root or (targets[0][0] if targets else os.getcwd())
+    n_alb = len(targets)
+    n_files = sum(len(p) for _, p, _ in targets)
+    head = Table.grid(padding=(0, 2))
+    head.add_column(style="dim", justify="right", no_wrap=True)
+    head.add_column(overflow="fold")
+    head.add_row("Étapes", Text("  ".join(f"{i}. {st.spec.label}" for i, st in enumerate(sc.steps, 1))))
+    if n_alb == 1 and targets[0][2]:
+        head.add_row("Cible", Text(f"1 morceau : {targets[0][1][0]}"))
+    else:
+        head.add_row("Cible", Text(f"{n_alb} album(s) · {n_files} morceau(x) · {root}"))
+    mode = ["simulation : rien ne sera écrit"] if simulation else \
+        ["tout est préparé d'abord ; rien n'est écrit avant ta confirmation"]
+    head.add_row("Mode", Text(" · ".join(mode + (["verbeux"] if verbose else [])), style="cyan"))
+    if sys.stdin.isatty():
+        head.add_row("Touches", Text("s = sauter l'étape en cours · q = arrêter · v = verbeux oui/non"))
+    console.print(Panel(head, title=Text(f" ▶ Script « {sc.name} » ", style="bold"), title_align="left",
+                        border_style="magenta", box=box.ROUNDED, padding=(0, 1)))
+    if not targets:
+        hint = ""
+        if os.path.isdir(root) and find_files(root, True, AUDIO_EXTS):
+            hint = ("\n[dim]Les sous-dossiers contiennent de la musique : ajoute -r pour traiter chaque album "
+                    "(dans musitag : active le mode récursif avec r).[/]")
+        info("Aucun fichier audio ici." + hint)
+        return 0
+    if n_alb >= BIG_RUN or (n_alb > 1 and _covers_library(root)):
+        where = "toute ta bibliothèque" if _covers_library(root) else root
+        info(f"[bold]Attention : ce script va être préparé sur {n_alb} albums ({n_files} morceaux), dans {escape(where)}.[/]\n\n"
+             "• Tout est d'abord préparé (les recherches en ligne prennent du temps), puis "
+             "[bold]une seule confirmation[/] porte sur l'ensemble.\n"
+             "• Le bilan montrera un résumé par album ; le détail complet restera consultable.\n"
+             "• Pendant la préparation, [bold]q[/] arrête et passe au bilan de ce qui est prêt.", "yellow")
+        if not confirm("Lancer quand même ?", False):
+            console.print("[yellow]Rien n'a été fait.[/]")
+            return 0
+    if not simulation and not _writable(targets):
+        info("Ton utilisateur ne peut pas modifier ces fichiers.\n"
+             f"Relance avec sudo : [bold]sudo musitag -s {escape(sc.name)} …[/]  "
+             "(ou essaie d'abord avec [bold]--simulation[/]).", "red")
+        return 1
+
+    ctx = RunCtx(verbose)
+    albums: List[AlbumPlan] = []
+    with KeyListener(ctx):
+        for pos, (folder, paths, single) in enumerate(targets, 1):
+            if ctx.stopping:
+                break
+            files, bad = load_files(paths)
+            al = AlbumPlan(folder, [Draft(af) for af in files], single=single, unreadable=bad)
+            console.print()
+            where = os.path.relpath(folder, root) if n_alb > 1 and os.path.isdir(root) else folder
+            console.print(Text.assemble(("  ", ""), (f"Album {pos}/{n_alb} · " if n_alb > 1 else "", "dim"),
+                                        (al.label, "bold"), (f"   {len(files)} morceau(x) · {where}", "dim")))
+            for p, why in bad:
+                console.print(Text(f"    ! illisible, ignoré : {os.path.basename(p)} ({why})", style="yellow"))
+            try:
+                plan_album(ctx, sc, al)
+            except KeyboardInterrupt:
+                ctx.stop.set()
+            al.release()
+            albums.append(al)
+    not_started = n_alb - len(albums)
+
+    tot = show_bilan(albums, not_started)
+    if not (tot["fichiers"] or tot["crees"] or tot["suppr"]):
+        info("Rien à modifier : tout est déjà comme le script le demande.", "green")
+        return 0
+    if simulation:
+        info("Simulation : rien n'a été écrit.", "cyan")
+        return 0
+    while True:
+        k = menu("Confirmation", [
+            ("1", "Tout appliquer", f"{tot['fichiers']} fichier(s)" + (f", {tot['crees']} piste(s) créée(s)" if tot["crees"] else "")
+             + (f", {tot['suppr']} suppression(s)" if tot["suppr"] else "")),
+            ("2", "Voir le détail", "toutes les modifications, album par album"),
+            ("0", "Annuler", "rien n'est écrit"),
+        ])
+        if k == "2":
+            show_detail(albums)
+            continue
+        if k == "0":
+            console.print("[yellow]Rien n'a été modifié.[/]")
+            return 0
+        break
+
+    console.print()
+    ctx.stop.clear()
+    total = dict(written=0, created=0, deleted=0)
+    all_errors: List[Tuple[str, str]] = []
+    todo = [al for al in albums if _changes(album_counts(al))]
+    with KeyListener(ctx, writing=True):
+        for pos, al in enumerate(todo, 1):
+            if ctx.stopping:
+                break
+            try:
+                with _spinner(f"[magenta]Écriture {pos}/{len(todo)} · {escape(al.label)}…[/]"
+                              + ("  [dim](q : arrêter après le fichier en cours)[/]" if sys.stdin.isatty() else "")):
+                    w, c, d, errs, notes = apply_album(ctx, al)
+            except KeyboardInterrupt:
+                ctx.stop.set()
+                continue
+            total["written"] += w
+            total["created"] += c
+            total["deleted"] += d
+            all_errors += [(f"{al.label} · {n}", e) for n, e in errs]
+            bits = [f"{w} fichier(s) écrit(s)"] + ([f"{c} piste(s) créée(s)"] if c else []) + \
+                ([f"{d} supprimé(s)"] if d else [])
+            stopped = any(n.startswith("arrêt demandé") for n in notes)
+            mark, style = ("✗", "red") if errs else (("■", "yellow") if stopped else ("✓", "green"))
+            console.print(Text.assemble(f"  {mark} ", (al.label, "bold"), " : " + " · ".join(bits), style=style))
+            for n in notes:
+                console.print(Text(f"    ! {n}", style="yellow"))
+    if ctx.stopping:
+        console.print("[yellow]Arrêté : les albums suivants n'ont pas été touchés.[/]")
+    summary = f"✓ {total['written']} fichier(s) écrit(s)"
+    if total["created"]:
+        summary += f" · {total['created']} piste(s) créée(s)"
+    if total["deleted"]:
+        summary += f" · {total['deleted']} élément(s) supprimé(s)"
+    console.print(Panel(Text(summary, style="bold green"), border_style="green", box=box.ROUNDED, expand=False))
+    if all_errors:
+        show_result(0, all_errors)
+    return 1 if all_errors else 0
+
+
+def script_cli(name: str, path: Optional[str], recursive: bool, verbose: bool, simulation: bool) -> int:
+    try:
+        sc = load_script(find_script(name))
+        path = os.path.abspath(os.path.expanduser(path or os.getcwd()))
+        if not os.path.exists(path):
+            raise ScriptError(f"Introuvable : {path}")
+        targets = collect_targets(path, recursive)
+    except ScriptError as e:
+        console.print(Text(str(e), style="red"))
+        return 1
+    try:
+        return run_script(sc, targets, verbose or sc.verbose, simulation, root=path)
+    except Cancel:
+        console.print("[yellow]Annulé.[/]")
+        return 1
+
+
+# ─── éditeur sans code (touche s) ───
+
+def steps_table(sc: Script) -> Table:
+    t = Table(box=box.SIMPLE_HEAD, header_style="bold magenta", expand=True, pad_edge=False)
+    t.add_column("#", style="dim", justify="right", no_wrap=True)
+    t.add_column("Action", style="bold", no_wrap=True)
+    t.add_column("Réglages", ratio=1, overflow="fold")
+    t.add_column("Si échec", no_wrap=True, style="dim")
+    for i, st in enumerate(sc.steps, 1):
+        fail = ("arrêter" if st.on_fail == "arreter" else "étape suivante") if st.spec.can_fail else "—"
+        t.add_row(str(i), Text(st.spec.label), Text(st.describe()), fail)
+    if not sc.steps:
+        t.add_row("", Text("aucune étape : « a » pour en ajouter", style="dim"), "", "")
+    return t
+
+
+def _ask_choice(title: str, choices: List[Tuple[str, str]], current: str) -> str:
+    opts, default = [], None
+    for i, (val, lab) in enumerate(choices, 1):
+        opts.append((str(i), lab, "actuel" if val == current else ""))
+        if val == current:
+            default = str(i)
+    k = menu(title, opts + [("0", "Annuler", "")], default=default)
+    if k == "0":
+        raise Cancel()
+    return choices[int(k) - 1][0]
+
+
+def _ask_ordered(title: str, choices: List[Tuple[str, str]], current: str, hint: str) -> str:
+    console.print(Text(f"  {title}", style="bold"))
+    for i, (val, lab) in enumerate(choices, 1):
+        console.print(f"   [cyan]{i:>2}[/]  {escape(lab)}")
+    cur_idx = [str(i) for i, (v, _) in enumerate(choices, 1) if v in _split_list(current)]
+    cur_idx.sort(key=lambda s: _split_list(current).index(choices[int(s) - 1][0]))
+    r = ask(f"  {hint} [magenta]›[/] ", prefill=", ".join(cur_idx)).strip()
+    picked: List[str] = []
+    for part in re.split(r"[,\s]+", r):
+        if part.isdigit() and 1 <= int(part) <= len(choices):
+            v = choices[int(part) - 1][0]
+            if v not in picked:
+                picked.append(v)
+    if not picked:
+        raise Cancel()
+    return ", ".join(["tout"] if "tout" in picked else picked)
+
+
+def _edit_fields(st: Step) -> bool:
+    while True:
+        console.print()
+        opts = [(str(i), LABEL[f], st.opts.get(f, "") if f in st.opts else "")
+                for i, f in enumerate(SCRIPT_FIELDS, 1)]
+        k = menu("Fixer des champs : lequel ?", opts + [None, ("t", "Terminé", f"{len(st.opts)} champ(s)"),
+                                                        ("0", "Annuler", "")], default="t")
+        if k == "0":
+            return False
+        if k == "t":
+            if not st.opts:
+                info("Choisis au moins un champ.")
+                continue
+            return True
+        f = SCRIPT_FIELDS[int(k) - 1]
+        console.print("[dim]  Valeur écrite dans tous les morceaux. Plusieurs valeurs : sépare-les par ;  "
+                      "· vide = vider ce champ · « x » = retirer de la liste[/]")
+        v = ask(field_prompt(LABEL[f]), prefill=st.opts.get(f, "")).strip()
+        if v.lower() == "x":
+            st.opts.pop(f, None)
+        else:
+            st.opts[f] = v
+
+
+def configure_step(spec: ActionSpec, cur: Optional[Step] = None) -> Optional[Step]:
+    """Règle une étape avec de petits menus. None si annulé."""
+    st = Step(spec.key, dict(cur.opts) if cur else {}, cur.on_fail if cur else "continuer")
+    console.print()
+    console.print(Rule(Text(f" {spec.label} ", style="bold magenta"), style="magenta", align="left"))
+    try:
+        if spec.free_keys and not _edit_fields(st):
+            return None
+        for o in spec.opts:
+            value = st.opt(o.key)
+            if spec.key == "pochette":
+                value = _ask_ordered("Sources de la pochette (la 1re qui donne une image l'emporte) :",
+                                     o.choices, value, "Numéros, dans l'ordre de priorité (ex : 2, 3, 4)")
+            elif o.multi:
+                value = _ask_ordered("Types de fichiers à supprimer :", o.choices, value,
+                                     "Numéros (ex : 1 pour tout, ou 2, 5)")
+            elif o.choices:
+                value = _ask_choice(o.label, o.choices, value)
+            elif spec.key == "renommer":
+                choices = RENAME_PRESETS + [("perso", "modèle personnalisé")]
+                cur_v = value if value in dict(RENAME_PRESETS) else "perso"
+                pick = _ask_choice("Modèle de nom", [(v, f"{lab}   {v}" if v != "perso" else lab)
+                                                     for v, lab in choices], cur_v)
+                if pick == "perso":
+                    console.print("[dim]  Champs possibles : {n} {title} {artist} {album} {year} {disc} {albumartist}[/]")
+                    value = ask(field_prompt("Modèle"), prefill=value).strip()
+                else:
+                    value = pick
+            else:
+                if spec.key == "supprimer_champs":
+                    console.print("[dim]  Séparés par des virgules : " + ", ".join(SCRIPT_FIELDS)
+                                  + ", encodeur, ou un nom exact (ex : REPLAYGAIN_TRACK_GAIN)[/]")
+                if spec.key == "remplacer" and o.key == "par":
+                    console.print("[dim]  Vide = supprimer le texte trouvé[/]")
+                value = ask(field_prompt(o.label), prefill=value)
+                if spec.key != "remplacer":
+                    value = value.strip()
+            st.opts[o.key] = value
+        validate_step(st)
+        if spec.can_fail:
+            st.on_fail = _ask_choice("Si cette étape échoue", FAIL_CHOICES, st.on_fail)
+    except Cancel:
+        return None
+    except ScriptError as e:
+        info(escape(str(e)), "red")
+        pause()
+        return None
+    return st
+
+
+def pick_action() -> Optional[ActionSpec]:
+    opts, group = [], None
+    for i, a in enumerate(ACTIONS, 1):
+        if a.group != group and opts:
+            opts.append(None)
+        group = a.group
+        opts.append((str(i), f"{a.group} · {a.label}", a.hint))
+    k = menu("Ajouter une étape", opts + [None, ("0", "Retour", "")])
+    return None if k == "0" else ACTIONS[int(k) - 1]
+
+
+def _ask_number(msg: str, n: int) -> Optional[int]:
+    r = ask(f"  {msg} [magenta]›[/] ").strip()
+    if r.isdigit() and 1 <= int(r) <= n:
+        return int(r) - 1
+    if r:
+        console.print("[red]Numéro hors liste.[/]")
+        time.sleep(0.6)
+    return None
+
+
+def edit_script(app, sc: Script) -> bool:
+    """Éditeur d'un script. Renvoie True s'il a été enregistré."""
+    original = dump_script(sc)
+    saved = False
+    while True:
+        app.clear()
+        console.print(Panel(Group(Text.assemble(("Fichier : ", "dim"),
+                                                (sc.path or os.path.join(SCRIPTS_DIR, sc.name + SCRIPT_EXT), "")),
+                                  Text.assemble(("Lancement : ", "dim"), (f"musitag -s {sc.name}", "bold"),
+                                                ("   (depuis le dossier d'un album ; -r pour tous les albums "
+                                                 "d'un dossier ; ou le chemin d'un morceau)", "dim")),
+                                  steps_table(sc)),
+                            title=Text(f" Script « {sc.name} » ", style="bold"), title_align="left",
+                            border_style="magenta", box=box.ROUNDED, padding=(0, 1)))
+        dirty = dump_script(sc) != original
+        opts = [("a", "Ajouter une étape", "")]
+        if sc.steps:
+            opts += [("m", "Modifier une étape", ""), ("d", "Déplacer une étape", ""), ("x", "Supprimer une étape", "")]
+        opts += [("v", "Verbeux : " + ("oui → non" if sc.verbose else "non → oui"), "il raconte tout en temps réel"),
+                 None, ("e", "Enregistrer", "modifications non enregistrées" if dirty else ""), ("0", "Retour", "")]
+        try:
+            k = menu("Modifier le script", opts)
+        except Cancel:
+            k = "0"
+        try:
+            if k == "a":
+                spec = pick_action()
+                if spec:
+                    st = configure_step(spec)
+                    if st:
+                        sc.steps.append(st)
+            elif k == "m":
+                i = _ask_number("Numéro de l'étape à modifier", len(sc.steps))
+                if i is not None:
+                    st = configure_step(sc.steps[i].spec, sc.steps[i])
+                    if st:
+                        sc.steps[i] = st
+            elif k == "d":
+                i = _ask_number("Numéro de l'étape à déplacer", len(sc.steps))
+                if i is not None:
+                    j = _ask_number("Nouvelle position", len(sc.steps))
+                    if j is not None:
+                        sc.steps.insert(j, sc.steps.pop(i))
+            elif k == "x":
+                i = _ask_number("Numéro de l'étape à supprimer", len(sc.steps))
+                if i is not None and confirm(f"Supprimer l'étape {i + 1} ({sc.steps[i].spec.label}) ?", True):
+                    sc.steps.pop(i)
+            elif k == "v":
+                sc.verbose = not sc.verbose
+            elif k == "e":
+                path = save_script(sc)
+                original, saved = dump_script(sc), True
+                info(f"✓ Enregistré : [bold]{escape(path)}[/]", "green")
+                time.sleep(0.8)
+            elif k == "0":
+                if dump_script(sc) != original and confirm("Enregistrer les modifications ?", True):
+                    save_script(sc)
+                    saved = True
+                return saved
+        except Cancel:
+            continue
+        except OSError as e:
+            info(f"Enregistrement impossible : {escape(str(e))}", "red")
+            pause()
+
+
+def _ask_new_name(prefill: str = "") -> Optional[str]:
+    console.print("[dim]  Lettres, chiffres, - et _ (les espaces deviennent des -). Ex : album-propre[/]")
+    name = clean_script_name(ask("  [bold]Nom du script[/] [magenta]›[/] ", prefill=prefill))
+    if not name:
+        return None
+    if os.path.exists(os.path.join(SCRIPTS_DIR, name + SCRIPT_EXT)):
+        info(f"Un script « {escape(name)} » existe déjà.", "red")
+        pause()
+        return None
+    return name
+
+
+def run_from_menu(app, sc: Script, single: Optional[str] = None, simulation: bool = False) -> None:
+    app.clear()
+    try:
+        targets = [(os.path.dirname(single), [single], True)] if single else \
+            collect_targets(app.folder, app.recursive)
+        run_script(sc, targets, sc.verbose, simulation, root=single or app.folder)
+    except ScriptError as e:
+        info(escape(str(e)), "red")
+    except Cancel:
+        console.print("[yellow]Annulé.[/]")
+    pause()
+    app.rescan()
+
+
+def script_screen(app, name: str) -> None:
+    while True:
+        path = os.path.join(SCRIPTS_DIR, name + SCRIPT_EXT)
+        app.screen()
+        try:
+            sc = load_script(path)
+        except ScriptError as e:
+            info(f"Ce script est illisible :\n{escape(str(e))}\n\n[dim]Fichier : {escape(path)}[/]", "red")
+            k = menu(f"Script « {name} »", [("7", "Supprimer ce script", ""), ("0", "Retour", "")])
+            if k == "7" and confirm(f"Supprimer « {escape(name)} » ?", False):
+                os.remove(path)
+            return
+        console.print(steps_table(sc))
+        where = app.folder + (" (et sous-dossiers : un album par dossier)" if app.recursive else "")
+        k = menu(f"Script « {name} »", [
+            ("1", "Lancer sur ce dossier", where),
+            ("2", "Lancer sur un morceau", "choisir le fichier"),
+            ("3", "Simulation sur ce dossier", "bilan sans rien écrire"),
+            None,
+            ("4", "Modifier", ""),
+            ("5", "Dupliquer", ""),
+            ("6", "Renommer", ""),
+            ("7", "Supprimer", ""),
+            ("0", "Retour", f"en ligne de commande : musitag -s {name}"),
+        ])
+        if k == "0":
+            return
+        if k == "1":
+            run_from_menu(app, sc)
+        elif k == "2":
+            idx = pick_file(app)
+            if idx is not None:
+                run_from_menu(app, sc, single=app.files[idx].path)
+        elif k == "3":
+            run_from_menu(app, sc, simulation=True)
+        elif k == "4":
+            edit_script(app, sc)
+        elif k == "5":
+            new = _ask_new_name(name + "-copie")
+            if new:
+                sc.name, sc.path = new, ""
+                save_script(sc)
+                name = new
+        elif k == "6":
+            new = _ask_new_name(name)
+            if new:
+                old = path
+                sc.name, sc.path = new, ""
+                save_script(sc)
+                os.remove(old)
+                name = new
+        elif k == "7":
+            if confirm(f"Supprimer définitivement le script « {escape(name)} » ?", False):
+                os.remove(path)
+                return
+
+
+def scripts_menu(app) -> None:
+    while True:
+        app.screen()
+        names = list_scripts()
+        opts = []
+        for i, n in enumerate(names, 1):
+            try:
+                summary = load_script(os.path.join(SCRIPTS_DIR, n + SCRIPT_EXT)).summary()
+            except ScriptError:
+                summary = "⚠ illisible"
+            opts.append((str(i), n, summary))
+        if not names:
+            console.print(Panel(Text.from_markup(
+                "Un script enchaîne des actions sur un album : paroles, pochette, tags, renommage, "
+                "nettoyage, découpage…\nTout est préparé, puis un bilan et [bold]une seule confirmation[/] "
+                "avant d'écrire.\nEnsuite, depuis le dossier d'un album : [bold]musitag -s NOM[/]"),
+                title=Text(" Scripts ", style="bold"), title_align="left", border_style="cyan", box=box.ROUNDED))
+        k = menu("Scripts", opts + [None, ("n", "Nouveau script", ""), ("0", "Retour", "")])
+        if k == "0":
+            return
+        if k == "n":
+            name = _ask_new_name()
+            if name:
+                sc = Script(name)
+                edit_script(app, sc)
+            continue
+        script_screen(app, names[int(k) - 1])
 
 
 # ═════════════════════════════════ Application ════════════════════════════════
@@ -4372,6 +6224,7 @@ class App:
                     ("4", "Modifier tous les fichiers", "champs communs, paroles, outils en lot"),
                     ("5", "Découper un CUE", "image CD + .cue → pistes FLAC taguées"),
                     ("6", "Nettoyer le dossier", "supprimer cover.jpg, .cue, .m3u, scans… (tout sauf la musique)"),
+                    ("s", "Scripts", "enchaîner des actions automatiquement (musitag -s NOM)"),
                     None,
                     ("o", "Ouvrir un dossier", "naviguer : Musiques → Artiste → Album"),
                     ("d", "Taper un chemin", ""),
@@ -4397,6 +6250,8 @@ class App:
                     cue_flow(self)
                 elif key == "6":
                     clean_flow(self)
+                elif key == "s":
+                    scripts_menu(self)
                 elif key == "o":
                     self.browse()
                 elif key == "p":
@@ -4425,15 +6280,34 @@ def main() -> None:
         epilog=f"exemples :\n  musitag              {MUSIC_ROOT} (ou l'album où tu te trouves)\n"
                "  musitag .            le dossier courant, quel qu'il soit\n"
                "  musitag ~/Musique    un dossier précis\n"
-               "  musitag -r Pixies    avec les sous-dossiers",
+               "  musitag -r Pixies    avec les sous-dossiers\n\n"
+               "scripts (créés dans musitag, touche s) :\n"
+               "  musitag -s album-propre                 l'album du dossier courant\n"
+               "  musitag -s album-propre CHEMIN          un autre album, ou un seul morceau\n"
+               "  musitag -s album-propre -r CHEMIN       chaque album sous ce dossier\n"
+               "  musitag -s album-propre --simulation    le bilan, sans rien écrire",
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("dossier", nargs="?", default=None,
-                    help=f"dossier à ouvrir (défaut : {MUSIC_ROOT})")
+    ap.add_argument("dossier", nargs="?", default=None, metavar="CHEMIN",
+                    help=f"dossier à ouvrir (défaut : {MUSIC_ROOT}) ; avec -s : album, dossier ou morceau "
+                         "(défaut : dossier courant)")
     g = ap.add_mutually_exclusive_group()
     g.add_argument("-r", "--recursif", action="store_true", help="inclure les sous-dossiers")
     g.add_argument("-n", "--non-recursif", action="store_true", help="ce dossier uniquement (défaut)")
+    ap.add_argument("-s", "--script", metavar="NOM",
+                    help="lance un script (.mst) : son nom, ou le chemin du fichier")
+    ap.add_argument("-v", "--verbeux", action="store_true", help="avec -s : raconte tout en temps réel")
+    ap.add_argument("--simulation", action="store_true", help="avec -s : le bilan, sans rien écrire")
     ap.add_argument("--version", action="version", version=f"musitag {VERSION}")
     args = ap.parse_args()
+    if (args.verbeux or args.simulation) and not args.script:
+        ap.error("-v et --simulation vont avec -s NOM")
+    if args.script:
+        try:
+            code = script_cli(args.script, args.dossier, args.recursif, args.verbeux, args.simulation)
+        except (KeyboardInterrupt, Cancel):
+            console.print("\n[yellow]Interrompu.[/]")
+            code = 1
+        sys.exit(code)
 
     notice = ""
     if args.dossier is not None:
