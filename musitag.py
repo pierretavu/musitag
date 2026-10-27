@@ -9,7 +9,8 @@ musitag — éditeur interactif de métadonnées audio, dans le terminal.
     rechercher/remplacer, renommage depuis les tags, pochettes, nettoyage
   • Paroles (synchronisées si possible) depuis LRCLIB, intégrées dans les fichiers ;
     les instrumentaux reçoivent « ♪ Musique sans paroles ♪ »
-  • Pochettes depuis Cover Art Archive, avec aperçu des éditions dans le terminal
+  • Pochettes depuis Cover Art Archive, avec aperçu des éditions dans le terminal ;
+    aperçu et extraction (JPEG, PNG) des pochettes déjà intégrées
   • Nettoyage : supprime tout ce qui n'est pas de la musique (cover.jpg, .cue, .m3u…)
   • Découpe une image CD + .cue en pistes FLAC taguées, au sample près
 
@@ -24,9 +25,11 @@ Installation (Fedora) : sudo dnf install python3-rich python3-mutagen python3-pi
 from __future__ import annotations
 
 import argparse
+import atexit
 import base64
 import codecs
 import glob
+import hashlib
 import io
 import json
 import os
@@ -35,6 +38,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import difflib
@@ -51,7 +55,7 @@ _VENDOR_DIR = "/opt/musitag/lib"
 if os.path.isdir(_VENDOR_DIR) and _VENDOR_DIR not in sys.path:
     sys.path.insert(0, _VENDOR_DIR)
 
-VERSION = "1.6.1"
+VERSION = "1.7"
 
 
 def install_cmd(*pkgs_by_distro: str) -> str:
@@ -1949,8 +1953,15 @@ def detail_panel(af: AudioFile, pos: Optional[int] = None, total: Optional[int] 
         v = af.get(f)
         g.add_row(label, Text(join_values(v)) if v else Text("—", style="dim"))
     pics = af.backend.pictures()
-    g.add_row("Pochette", Text(", ".join(f"{m} · {human_size(s)}" for m, s in pics)) if pics
-              else Text("aucune intégrée", style="dim"))
+    front = first_picture(af) if pics else None
+    if len(pics) == 1 and front:
+        pic_text = Text(cover_line(front))
+    elif pics:
+        pic_text = Text(f"{len(pics)} images : " + ", ".join(f"{m} · {human_size(s)}" for m, s in pics)
+                        + (f" (face avant : {image_dims(front)})" if front and image_dims(front) else ""))
+    else:
+        pic_text = Text("aucune intégrée", style="dim")
+    g.add_row("Pochette", pic_text)
     lyr = get_lyrics(af)
     g.add_row("Paroles", Text(lyrics_summary(lyr), style="green" if is_synced(lyr) else "")
               if lyr else Text("aucune", style="dim"))
@@ -2376,14 +2387,378 @@ def read_image(path: str):
     return data, mime
 
 
-def batch_pictures(files) -> None:
-    k = menu("Pochettes intégrées", [
-        ("1", "Chercher en ligne", "Cover Art Archive : aperçus et choix de l'édition"),
-        ("2", "Intégrer l'image du dossier", "cover.jpg, folder.jpg, front.jpg…"),
-        ("3", "Intégrer une image précise", "chemin vers un .jpg ou .png"),
-        ("4", "Supprimer les pochettes intégrées", ""),
+# ─── pochettes déjà intégrées : état, aperçu, extraction ───
+
+@dataclass
+class CoverGroup:
+    """Une image intégrée, identique (octet pour octet) dans un ou plusieurs fichiers."""
+    data: bytes
+    files: list
+
+
+def image_kind(data: bytes) -> Tuple[str, str]:
+    """(format lisible, extension) : JPEG/.jpg, PNG/.png, sinon d'après Pillow ; ('?', '') si inconnu."""
+    mime = image_mime(data)
+    if mime == "image/jpeg":
+        return "JPEG", ".jpg"
+    if mime == "image/png":
+        return "PNG", ".png"
+    if PILImage is not None and data:
+        try:
+            fmt = (PILImage.open(io.BytesIO(data)).format or "").upper()
+        except Exception:
+            fmt = ""
+        ext = {"GIF": ".gif", "WEBP": ".webp", "BMP": ".bmp", "TIFF": ".tif"}.get(fmt)
+        if ext:
+            return fmt, ext
+    return "?", ""
+
+
+def cover_survey(files) -> Tuple[List[CoverGroup], list]:
+    """Pochettes intégrées, regroupées par image identique (la plus fréquente d'abord),
+    et fichiers qui n'en ont pas."""
+    groups: Dict[bytes, CoverGroup] = {}
+    missing = []
+    for af in files:
+        data = first_picture(af)
+        if not data:
+            missing.append(af)
+            continue
+        key = hashlib.sha1(data).digest()
+        if key not in groups:
+            groups[key] = CoverGroup(data, [])
+        groups[key].files.append(af)
+    return sorted(groups.values(), key=lambda g: -len(g.files)), missing
+
+
+def cover_line(data: bytes) -> str:
+    """« 1000×1000 · JPEG · 245,0 Ko »"""
+    kind, _ = image_kind(data)
+    return " · ".join(x for x in (image_dims(data), kind if kind != "?" else "format inconnu",
+                                  human_size(len(data))) if x)
+
+
+def folder_image_line(folder: str) -> str:
+    """« cover.jpg (1400×1400 · 310,2 Ko) », ou '' s'il n'y a pas d'image de pochette dans le dossier."""
+    path = find_cover(folder)
+    if not path:
+        return ""
+    dims = ""
+    if PILImage is not None:
+        try:
+            with PILImage.open(path) as im:
+                dims = f"{im.size[0]}×{im.size[1]}"
+        except Exception:
+            dims = ""
+    try:
+        size = human_size(os.path.getsize(path))
+    except OSError:
+        size = ""
+    details = " · ".join(x for x in (dims, size) if x)
+    return os.path.basename(path) + (f" ({details})" if details else "")
+
+
+def cover_status(files, groups: List[CoverGroup], missing: list) -> Tuple[str, str]:
+    """(texte, couleur) : où en sont les pochettes intégrées de ces fichiers."""
+    total = len(files)
+    dirs = group_by_dir(files)
+    with_pic = total - len(missing)
+    if not groups:
+        lines = [f"Aucune pochette intégrée dans {'ce fichier' if total == 1 else f'ces {total} fichiers'}."]
+    elif total == 1:
+        lines = [f"Pochette intégrée : {cover_line(groups[0].data)}"]
+    else:
+        line = f"Pochette intégrée dans [bold]{with_pic}/{total}[/] fichiers"
+        if len(dirs) == 1:
+            line += (f" · {cover_line(groups[0].data)}" if len(groups) == 1
+                     else f" · [bold yellow]{len(groups)} images différentes[/]")
+        lines = [line]
+        if missing:
+            lines.append(f"[yellow]{len(missing)} fichier(s) sans pochette[/]")
+        if len(dirs) > 1:
+            bare = sum(1 for _, fl in dirs if all(af in missing for af in fl))
+            lines.append(f"{len(dirs)} dossiers" + (f", dont [yellow]{bare} sans aucune pochette[/]" if bare else ""))
+    if len(dirs) == 1:
+        img = folder_image_line(dirs[0][0])
+        lines.append("Image dans le dossier : " + (escape(img) if img else "[dim]aucune[/]"))
+    ok = bool(groups) and not missing and (len(groups) == 1 or len(dirs) > 1)
+    return "\n".join(lines), "green" if ok else "yellow"
+
+
+def show_big_cover(data: bytes, caption: str) -> None:
+    """Une seule pochette, aussi grande que l'écran le permet."""
+    cols = max(16, min(64, console.width - 4, 2 * (console.height - 12)))
+    p = image_preview(data, cols)
+    if p is None:
+        console.print("[dim](pas d'aperçu : image illisible, ou Pillow absent)[/]")
+    else:
+        img_console().print(p)
+    console.print(Text(caption, style="dim"))
+
+
+_VIEWER_DIR: Optional[str] = None
+
+
+def can_open_viewer() -> bool:
+    """Une session graphique (bureau) où ouvrir une image en grand ?"""
+    return bool((os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")) and shutil.which("xdg-open"))
+
+
+def open_in_viewer(data: bytes) -> Optional[str]:
+    """Ouvre l'image dans la visionneuse du bureau (copie temporaire, effacée en quittant musitag).
+    Renvoie l'erreur éventuelle."""
+    global _VIEWER_DIR
+    _, ext = image_kind(data)
+    try:
+        if _VIEWER_DIR is None:
+            _VIEWER_DIR = tempfile.mkdtemp(prefix="musitag-apercu-")
+            atexit.register(shutil.rmtree, _VIEWER_DIR, True)
+        fd, path = tempfile.mkstemp(suffix=ext or ".img", dir=_VIEWER_DIR)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+        subprocess.Popen(["xdg-open", path], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+        return None
+    except OSError as e:
+        return str(e)
+
+
+def _cover_entries(groups: List[CoverGroup]):
+    return [(str(i), g.data, f"{len(g.files)} fichier(s)", cover_line(g.data))
+            for i, g in enumerate(groups[:MAX_COVERS], 1)]
+
+
+def view_covers(files) -> None:
+    groups, missing = cover_survey(files)
+    if not groups:
+        info("Aucune pochette intégrée à afficher.")
+        pause()
+        return
+    dirs = group_by_dir(files)
+    console.print()
+    if len(groups) == 1:
+        g = groups[0]
+        show_big_cover(g.data, f"{cover_line(g.data)} · dans {len(g.files)} fichier(s)")
+    else:
+        show_covers(_cover_entries(groups))
+        if len(groups) > MAX_COVERS:
+            console.print(f"[dim]… et {len(groups) - MAX_COVERS} autre(s) image(s), non affichée(s)[/]")
+    if len(dirs) == 1 and (len(groups) > 1 or missing) and len(files) > 1:
+        number = {id(af): str(i) for i, g in enumerate(groups, 1) for af in g.files}
+        t = Table(box=box.SIMPLE_HEAD, header_style="bold", pad_edge=False)
+        t.add_column("Fichier", overflow="fold")
+        t.add_column("Pochette", no_wrap=True)
+        for af in sorted(files, key=lambda a: natural_key(a.name)):
+            n = number.get(id(af))
+            t.add_row(Text(af.name), Text(f"image {n}") if n else Text("aucune", style="yellow"))
+        console.print(t)
+    elif missing:
+        names = ", ".join(os.path.relpath(af.path, os.path.commonpath([d for d, _ in dirs])) for af in missing[:10])
+        console.print(Text(f"Sans pochette : {names}" + (" …" if len(missing) > 10 else ""), style="yellow"))
+    if can_open_viewer():
+        n = min(len(groups), MAX_COVERS)
+        r = ask(f"  Ouvrir en grand dans la visionneuse : [bold]numéro[/] de l'image "
+                f"[dim](1{'-' + str(n) if n > 1 else ''})[/], Entrée pour revenir [magenta]›[/] ").strip()
+        if r.isdigit() and 1 <= int(r) <= n:
+            err = open_in_viewer(groups[int(r) - 1].data)
+            if err:
+                info(f"Impossible d'ouvrir la visionneuse : {escape(err)}", "red")
+                pause()
+    else:
+        pause()
+
+
+EXPORT_FORMATS = {"orig": "format d'origine", "jpeg": "JPEG", "png": "PNG"}
+
+
+def encode_image(data: bytes, fmt: str) -> Tuple[bytes, str]:
+    """(données, extension) de l'image dans le format voulu. Le format d'origine, ou un format
+    identique à celui de l'image, n'est jamais réencodé : aucune perte de qualité."""
+    kind, ext = image_kind(data)
+    if fmt == "orig" or (fmt == "jpeg" and kind == "JPEG") or (fmt == "png" and kind == "PNG"):
+        if not ext:
+            raise TagError("format d'image inconnu : choisis JPEG ou PNG")
+        return data, ext
+    if PILImage is None:
+        raise TagError("conversion impossible sans Pillow (paquet python3-pillow)")
+    im = open_image(data)
+    im.load()
+    buf = io.BytesIO()
+    if fmt == "jpeg":
+        if im.mode in ("RGBA", "LA", "PA") or (im.mode == "P" and "transparency" in im.info):
+            im = im.convert("RGBA")
+            bg = PILImage.new("RGB", im.size, (255, 255, 255))     # transparence → fond blanc
+            bg.paste(im, mask=im.getchannel("A"))
+            im = bg
+        elif im.mode != "RGB":
+            im = im.convert("RGB")
+        im.save(buf, "JPEG", quality=95, optimize=True)
+        return buf.getvalue(), ".jpg"
+    if fmt == "png":
+        if im.mode not in ("1", "L", "LA", "P", "RGB", "RGBA", "I", "I;16"):
+            im = im.convert("RGB")                                 # CMYK, YCbCr…
+        im.save(buf, "PNG", optimize=True)
+        return buf.getvalue(), ".png"
+    raise ValueError(f"format inconnu : {fmt}")
+
+
+@dataclass
+class CoverExport:
+    folder: str
+    group: CoverGroup
+    path: str
+    data: bytes
+    state: str            # nouveau / remplace / identique
+
+
+def plan_cover_exports(picks: List[Tuple[str, CoverGroup]], fmt: str, base: str):
+    """Ce qu'il faudrait écrire : ([CoverExport], [(dossier, erreur)]). N'écrit rien."""
+    plans, errors = [], []
+    for folder, g in picks:
+        try:
+            data, ext = encode_image(g.data, fmt)
+        except Exception as e:                       # TagError, image illisible ou démesurée…
+            errors.append((folder, friendly_error(e)))
+            continue
+        path = os.path.join(folder, base + ext)
+        if os.path.isdir(path):
+            errors.append((folder, f"un dossier s'appelle déjà {base + ext}"))
+            continue
+        state = "nouveau"
+        if os.path.lexists(path):
+            state = "remplace"
+            if os.path.isfile(path) and not os.path.islink(path):
+                try:
+                    with open(path, "rb") as fh:
+                        if fh.read(len(data) + 1) == data:
+                            state = "identique"
+                except OSError:
+                    pass
+        plans.append(CoverExport(folder, g, path, data, state))
+    return plans, errors
+
+
+def write_cover_export(p: CoverExport) -> Optional[str]:
+    """Écrit l'image (fichier temporaire, puis remplacement : jamais d'écriture à travers un lien
+    symbolique). Renvoie l'erreur éventuelle."""
+    tmp = None
+    try:
+        fd, tmp = tempfile.mkstemp(prefix=".musitag-", suffix=os.path.splitext(p.path)[1], dir=p.folder)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(p.data)
+        mask = os.umask(0)
+        os.umask(mask)
+        os.chmod(tmp, 0o666 & ~mask)                  # mêmes droits qu'un fichier créé normalement
+        os.replace(tmp, p.path)
+        tmp = None
+        return None
+    except OSError as e:
+        return friendly_error(e)
+    finally:
+        if tmp and os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
+def extract_covers(files) -> None:
+    groups, _ = cover_survey(files)
+    if not groups:
+        info("Aucune pochette intégrée à extraire.")
+        pause()
+        return
+    dirs = group_by_dir(files)
+    if len(dirs) == 1:
+        pick = groups[0]
+        if len(groups) > 1:
+            console.print()
+            show_covers(_cover_entries(groups))
+            n = min(len(groups), MAX_COVERS)
+            r = ask(f"  Image à extraire [dim](1-{n}, Entrée = 1)[/] [magenta]›[/] ").strip() or "1"
+            if not (r.isdigit() and 1 <= int(r) <= n):
+                return
+            pick = groups[int(r) - 1]
+        picks = [(dirs[0][0], pick)]
+    else:
+        picks = []
+        for d, fl in dirs:
+            sub, _ = cover_survey(fl)
+            if sub:
+                picks.append((d, sub[0]))           # l'image la plus présente dans l'album
+        info(f"Une image par dossier ({len(picks)}/{len(dirs)} ont une pochette intégrée) : "
+             "pour chacun, la pochette la plus présente dans ses fichiers.", "cyan")
+    kinds = sorted({image_kind(g.data)[0] for _, g in picks})
+    k = menu("Format de l'image", [
+        ("1", "Format d'origine", f"{' / '.join(kinds)}, copié tel quel, aucune perte"),
+        ("2", "JPEG", "réencodé en qualité 95 (copié tel quel s'il est déjà en JPEG)"),
+        ("3", "PNG", "sans perte, plus lourd (copié tel quel s'il est déjà en PNG)"),
         ("0", "Retour", ""),
-    ])
+    ], default="1")
+    if k == "0":
+        return
+    fmt = {"1": "orig", "2": "jpeg", "3": "png"}[k]
+    base = safe_name(ask("  Nom du fichier [dim](sans extension)[/] [magenta]›[/] ", prefill="cover").strip()
+                     or "cover")
+    with console.status("[magenta]Préparation des images…[/]", spinner="dots"):
+        plans, errors = plan_cover_exports(picks, fmt, base)
+    root = dirs[0][0] if len(dirs) == 1 else os.path.commonpath([d for d, _ in dirs])
+    states = {"nouveau": Text("nouveau", style="green"),
+              "remplace": Text("remplace le fichier existant", style="yellow"),
+              "identique": Text("déjà là, identique", style="dim")}
+    t = Table(box=box.SIMPLE_HEAD, header_style="bold", pad_edge=False)
+    t.add_column("Fichier", overflow="fold")
+    t.add_column("Image", no_wrap=True)
+    t.add_column("État", no_wrap=True)
+    for p in plans:
+        shown = os.path.basename(p.path) if len(dirs) == 1 else os.path.relpath(p.path, root)
+        t.add_row(Text(shown), Text(cover_line(p.data)), states[p.state])
+    if plans:
+        console.print(t)
+    for folder, err in errors:
+        console.print(Text(f"✗ {os.path.relpath(folder, root) if len(dirs) > 1 else folder} : {err}", style="red"))
+    replace = [p for p in plans if p.state == "remplace"]
+    if replace and not confirm(f"{len(replace)} fichier(s) du même nom existe(nt) déjà : les remplacer ?", False):
+        plans = [p for p in plans if p.state != "remplace"]
+    todo = [p for p in plans if p.state != "identique"]
+    if not todo:
+        info("Rien à écrire.")
+        pause()
+        return
+    if not confirm(f"Écrire {len(todo)} image(s) ?", True):
+        return
+    failed = [(p, err) for p in todo for err in [write_cover_export(p)] if err]
+    for p, err in failed:
+        console.print(Text(f"✗ {p.path} : {err}", style="red"))
+    done = len(todo) - len(failed)
+    if done:
+        where = todo[0].path if len(todo) == 1 else f"{done} dossier(s), sous le nom {base}.*"
+        info(f"✓ Pochette extraite : {escape(where)}", "green")
+    pause()
+
+
+def batch_pictures(files) -> None:
+    while True:
+        groups, missing = cover_survey(files)
+        text, style = cover_status(files, groups, missing)
+        info(text, style)
+        k = menu("Pochettes intégrées", [
+            ("1", "Chercher en ligne", "Cover Art Archive : aperçus et choix de l'édition"),
+            ("2", "Intégrer l'image du dossier", "cover.jpg, folder.jpg, front.jpg…"),
+            ("3", "Intégrer une image précise", "chemin vers un .jpg ou .png"),
+            ("4", "Supprimer les pochettes intégrées", ""),
+            None,
+            ("5", "Voir les pochettes intégrées", "aperçu, dimensions, fichiers sans pochette"),
+            ("6", "Extraire la pochette", "en fichier image : format d'origine, JPEG ou PNG"),
+            ("0", "Retour", ""),
+        ])
+        if k == "5":
+            view_covers(files)
+            continue
+        if k == "6":
+            extract_covers(files)
+            continue
+        break
     if k == "0":
         return
     if k == "1":
@@ -4154,27 +4529,48 @@ def clean_table(items: List[CleanItem], base: str):
 
 
 def first_picture(af) -> Optional[bytes]:
-    """Données de la première image intégrée (pour l'aperçu de la pochette actuelle)."""
+    """Données de la pochette intégrée : l'image « face avant » quand le format précise le type
+    des images (FLAC, Ogg, MP3, APE, WMA), sinon la première."""
     mf, b = af.mf, af.backend
+
+    def front(items) -> Optional[bytes]:            # [(type d'image, données)]
+        items = [(t, d) for t, d in items if d]
+        if not items:
+            return None
+        return next((d for t, d in items if t == 3), items[0][1])
+
     try:
         if isinstance(mf, FLAC) and mf.pictures:
-            return mf.pictures[0].data
+            return front([(p.type, p.data) for p in mf.pictures])
         if isinstance(b, VorbisBackend):
+            pics = []
             for v in b._vals("METADATA_BLOCK_PICTURE"):
-                return Picture(base64.b64decode(v)).data
+                try:
+                    p = Picture(base64.b64decode(v))
+                except Exception:
+                    continue
+                pics.append((p.type, p.data))
+            if pics:
+                return front(pics)
+            for v in b._vals("COVERART"):              # ancienne façon : image brute en base64
+                try:
+                    return base64.b64decode(v) or None
+                except Exception:
+                    continue
         if isinstance(b, ID3Backend) and mf.tags is not None:
-            apics = mf.tags.getall("APIC")
-            if apics:
-                return apics[0].data
+            return front([(int(a.type), a.data) for a in mf.tags.getall("APIC")])
         if isinstance(b, MP4Backend) and mf.tags is not None and mf.tags.get("covr"):
             return bytes(mf.tags["covr"][0])
         if isinstance(b, APEBackend):
+            items = []
             for k in b._pic_keys():
                 raw = mf.tags[k].value
-                return raw.split(b"\x00", 1)[1] if b"\x00" in raw[:256] else raw
+                data = raw.split(b"\x00", 1)[1] if b"\x00" in raw[:256] else raw
+                items.append((3 if k.lower() == "cover art (front)" else 0, data))
+            return front(items)
         if isinstance(b, ASFBackend):
-            for v in mf.tags.get("WM/Picture", []):
-                return _asf_picture(v.value)[1]
+            return front([(v.value[0] if v.value else 0, _asf_picture(v.value)[1])
+                          for v in mf.tags.get("WM/Picture", [])])
     except Exception:
         return None
     return None

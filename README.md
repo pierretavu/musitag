@@ -14,7 +14,8 @@ sans fichier annexe.
   existent, et mention « ♪ Musique sans paroles ♪ » pour les morceaux instrumentaux.
 - **Pochettes** : recherche sur [MusicBrainz](https://musicbrainz.org) et
   [Cover Art Archive](https://coverartarchive.org), avec aperçu des différentes éditions
-  directement dans le terminal.
+  directement dans le terminal ; état, aperçu et extraction (JPEG, PNG) des pochettes déjà
+  intégrées.
 - **Images CD** : découpage d'une image (FLAC, APE, WavPack, WAV…) et de son `.cue` en pistes
   FLAC taguées, au sample près, avec détection automatique de l'encodage du `.cue`.
 - **Nettoyage** : suppression des fichiers annexes d'un album (scans, `.cue`, `.m3u`, `.log`…),
@@ -128,7 +129,7 @@ dossier musique n'est trouvé, il ouvre le dossier personnel et l'indique au dé
 | `4` | Rechercher / remplacer dans un champ (ex. : retirer « (2016 Remaster) ») |
 | `5` | Renommage des fichiers d'après les tags, selon un modèle prédéfini ou personnalisé |
 | `6` | Suppression de champs (COMMENT, ENCODER…) |
-| `7` | Pochettes : recherche en ligne, image du dossier, suppression |
+| `7` | Pochettes : état et aperçu des pochettes intégrées, extraction en fichier image, recherche en ligne, image du dossier, suppression |
 | `8` | Paroles : recherche sur LRCLIB, mention instrumentale, suppression |
 | `9` | Effacement de tous les tags |
 
@@ -150,8 +151,20 @@ d'ici là ; supprimer ce fichier force une nouvelle recherche.
 
 ### Pochettes
 
-Les éditions de l'album sont recherchées sur MusicBrainz et Cover Art Archive, puis affichées en
-aperçu dans le terminal. La pochette choisie est intégrée à tous les fichiers de l'album.
+Le menu des pochettes commence par un état des lieux : nombre de fichiers dotés d'une pochette
+intégrée, dimensions, format et poids de l'image, présence de plusieurs images différentes dans
+l'album, image éventuelle dans le dossier.
+
+| Touche | Action |
+|---|---|
+| `1` | Recherche en ligne : les éditions de l'album sont recherchées sur MusicBrainz et Cover Art Archive, puis affichées en aperçu ; la pochette choisie est intégrée à tous les fichiers de l'album |
+| `2` | Intégration de l'image du dossier (`cover.jpg`, `folder.jpg`, `front.jpg`…) |
+| `3` | Intégration d'une image précise (JPEG ou PNG) |
+| `4` | Suppression des pochettes intégrées |
+| `5` | Aperçu des pochettes intégrées dans le terminal, et liste des fichiers qui n'en ont pas ; depuis un bureau, ouverture dans la visionneuse d'images |
+| `6` | Extraction de la pochette dans le dossier de l'album, au format d'origine (sans perte), en JPEG ou en PNG ; une image par dossier sur plusieurs albums |
+
+Lorsqu'un fichier contient plusieurs images (face avant, dos, livret), la face avant est retenue.
 
 ### Images CD
 
@@ -284,5 +297,6 @@ programmes.
 | 1.5.3 | Installation : détection d'un dépôt cloné dans `/usr/local/bin` |
 | 1.6 | Scripts : enchaînements d'actions sans code, lancés avec `musitag -s` |
 | 1.6.1 | Paroles : bien moins de requêtes à LRCLIB, pause automatique quand il sature, introuvables mémorisés |
+| 1.7 | Pochettes intégrées : état des lieux, aperçu en grand, extraction en JPEG ou PNG |
 
 Le détail de chaque version figure dans [CHANGELOG.md](CHANGELOG.md).

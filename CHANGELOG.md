@@ -1,5 +1,20 @@
 # Journal des versions
 
+## 1.7 — 27 octobre 2026
+- Pochettes : le menu des pochettes indique d'emblée où elles en sont : combien de fichiers
+  ont une pochette intégrée, ses dimensions, son format et son poids, si plusieurs images
+  différentes cohabitent dans l'album, et quelle image se trouve dans le dossier.
+- Pochettes : **Voir les pochettes intégrées** affiche la pochette en grand dans le terminal,
+  ou chaque image différente côte à côte avec la liste des fichiers qui portent chacune (et
+  ceux qui n'en ont pas). Depuis un bureau, l'image peut aussi s'ouvrir dans la visionneuse.
+- Pochettes : **Extraire la pochette** l'enregistre en fichier image dans le dossier de
+  l'album (`cover.jpg` ou `cover.png` par défaut, nom au choix) : au format d'origine, sans
+  aucune perte, ou converti en JPEG ou en PNG. Sur plusieurs albums à la fois, une image par
+  dossier. Un fichier existant n'est remplacé qu'après confirmation.
+- Pochettes : quand un fichier contient plusieurs images (face avant, dos, livret…), c'est la
+  face avant qui est retenue pour l'aperçu, l'extraction et les scripts.
+- Fiche d'un fichier : dimensions de la pochette intégrée.
+
 ## 1.6.1 — 18 octobre 2026
 - Paroles : musitag n'insiste plus quand LRCLIB sature. Un seul réessai court par requête ;
   après plusieurs échecs d'affilée, LRCLIB est mis en pause (1 minute, puis plus longtemps
